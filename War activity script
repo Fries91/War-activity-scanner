@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WRATH Pre-War Intelligence v3 - Enemy War Profile
+// @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.1.0
-// @description  PDA-first enemy war profiling with historical participation, estimated minimum energy use, trends, and locally observed pre-war activity.
+// @version      3.2.0
+// @description  PDA-first war profiling for your own faction or current enemy: participation, energy estimates, trends, war team roles, and activity watch.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @icon         https://www.torn.com/favicon.ico
@@ -20,8 +20,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.1.0';
-  const BUILD = 'ENEMY-WAR-PROFILE-ENERGY-20260819';
+  const VERSION = '3.2.0';
+  const BUILD = 'MY-FACTION-ENEMY-TOGGLE-20260819';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -36,8 +36,9 @@
     me: null,
     ownFaction: null,
     ownId: 0,
-    enemy: null,
-    enemyId: 0,
+    target: null,
+    targetId: 0,
+    scope: storageGet('prewarScope', 'own') === 'enemy' ? 'enemy' : 'own',
     currentWar: null,
     roster: [],
     reports: [],
@@ -226,7 +227,7 @@
   }
 
   function currentFactionName(data) {
-    return data?.name || data?.basic?.name || data?.faction?.name || 'Enemy faction';
+    return data?.name || data?.basic?.name || data?.faction?.name || 'Faction';
   }
 
   function currentFactionTag(data) {
@@ -274,9 +275,9 @@
     });
   }
 
-  function getCompletedEnemyWars(enemyData) {
+  function getCompletedTargetWars(targetData) {
     const now = nowSec();
-    return getWars(enemyData)
+    return getWars(targetData)
       .map(([id, rw]) => ({
         id: String(id),
         rw,
@@ -302,7 +303,7 @@
   }
 
   async function discoverCompletedWars(count) {
-    const base = getCompletedEnemyWars(state.enemy);
+    const base = getCompletedTargetWars(state.target);
     const seen = new Set(base.map(w => String(w.id)));
     const wars = base.slice();
     if (wars.length >= count) return wars.slice(0, count);
@@ -313,7 +314,7 @@
     for (let page = 0; page < 12 && wars.length < count; page++) {
       try {
         const suffix = to ? `&to=${to}` : '';
-        const data = await apiV1(`/faction/${state.enemyId}?selections=mainnews${suffix}`);
+        const data = await apiV1(`/faction/${state.targetId}?selections=mainnews${suffix}`);
         const parsed = parseRankIdsFromNews(data);
         if (!parsed.entries.length) break;
         for (const w of parsed.wars) {
@@ -335,13 +336,13 @@
     return wars.sort((a,b)=>(b.end||b.start||0)-(a.end||a.start||0)).slice(0,count);
   }
 
-  function normalizeReport(data, enemyId, fallbackWar) {
+  function normalizeReport(data, targetId, fallbackWar) {
     const rr = data?.rankedwarreport || data?.ranked_war_report || data?.report || data;
     const factions = factionEntries(rr?.factions || rr?.participants || {});
-    let enemyEntry = factions.find(([id, f]) => num(id) === num(enemyId) || num(f?.id || f?.faction_id) === num(enemyId));
-    if (!enemyEntry) return null;
+    let targetEntry = factions.find(([id, f]) => num(id) === num(targetId) || num(f?.id || f?.faction_id) === num(targetId));
+    if (!targetEntry) return null;
 
-    const [fKey, f] = enemyEntry;
+    const [fKey, f] = targetEntry;
     const rawMembers = f?.members || [];
     const members = [];
 
@@ -371,24 +372,24 @@
       });
     }
 
-    const other = factions.find(([id, x]) => num(id) !== num(enemyId));
+    const other = factions.find(([id, x]) => num(id) !== num(targetId));
     const war = rr?.war || {};
     const start = num(war?.start || rr?.start || fallbackWar?.start);
     const end = num(war?.end || rr?.end || fallbackWar?.end);
     const winner = num(war?.winner || rr?.winner);
-    const enemyScore = num(f?.score);
+    const targetScore = num(f?.score);
     const otherScore = num(other?.[1]?.score);
 
     let result = '—';
-    if (winner) result = winner === num(enemyId) ? 'W' : 'L';
-    else if (enemyScore || otherScore) result = enemyScore > otherScore ? 'W' : enemyScore < otherScore ? 'L' : 'D';
+    if (winner) result = winner === num(targetId) ? 'W' : 'L';
+    else if (targetScore || otherScore) result = targetScore > otherScore ? 'W' : targetScore < otherScore ? 'L' : 'D';
 
     return {
       id: String(fallbackWar?.id || rr?.id || ''),
       start,
       end,
       result,
-      enemyScore,
+      targetScore,
       otherScore,
       opponentId: num(other?.[0] || other?.[1]?.id || other?.[1]?.faction_id),
       opponentName: other?.[1]?.name || 'Opponent',
@@ -400,45 +401,45 @@
     let firstErr = null;
     try {
       const data = await apiV2(`/faction/${encodeURIComponent(war.id)}/rankedwarreport`);
-      const normalized = normalizeReport(data, state.enemyId, war);
+      const normalized = normalizeReport(data, state.targetId, war);
       if (normalized) return normalized;
-      firstErr = new Error('v2 report did not contain enemy member data.');
+      firstErr = new Error('v2 report did not contain selected faction member data.');
     } catch (e) {
       firstErr = e;
     }
 
     try {
       const data = await apiV1(`/torn/${encodeURIComponent(war.id)}?selections=rankedwarreport`);
-      const normalized = normalizeReport(data, state.enemyId, war);
+      const normalized = normalizeReport(data, state.targetId, war);
       if (normalized) return normalized;
-      throw new Error('v1 report did not contain enemy member data.');
+      throw new Error('v1 report did not contain selected faction member data.');
     } catch (e) {
       throw new Error(`War ${war.id}: ${e?.message || firstErr?.message || 'report unavailable'}`);
     }
   }
 
-  function historyCacheKey(enemyId, count) {
-    return `prewarHistoryCache:${enemyId}:${count}`;
+  function historyCacheKey(targetId, count) {
+    return `prewarHistoryCache:${targetId}:${count}`;
   }
 
   function serializeReports(reports) {
     return reports.map(r => ({
       id: r.id, start: r.start, end: r.end, result: r.result,
-      enemyScore: r.enemyScore, otherScore: r.otherScore,
+      targetScore: r.targetScore, otherScore: r.otherScore,
       opponentId: r.opponentId, opponentName: r.opponentName,
       members: r.members,
     }));
   }
 
-  function loadCachedReports(enemyId, count) {
-    const c = storageGet(historyCacheKey(enemyId, count), null);
+  function loadCachedReports(targetId, count) {
+    const c = storageGet(historyCacheKey(targetId, count), null);
     if (!c || !Array.isArray(c.reports) || !c.at) return null;
     if (Date.now() - Number(c.at) > HISTORY_CACHE_MS) return null;
     return c.reports;
   }
 
-  function saveCachedReports(enemyId, count, reports) {
-    storageSet(historyCacheKey(enemyId, count), {
+  function saveCachedReports(targetId, count, reports) {
+    storageSet(historyCacheKey(targetId, count), {
       at: Date.now(),
       reports: serializeReports(reports)
     });
@@ -608,7 +609,7 @@
   }
 
   async function analyzeHistory(force = false) {
-    if (!state.apiKey || !state.enemyId || state.analyzing) return;
+    if (!state.apiKey || !state.targetId || state.analyzing) return;
     state.analyzing = true;
     state.error = '';
     state.warning = '';
@@ -617,7 +618,7 @@
     try {
       const count = Math.max(3, Math.min(20, num(state.historyCount, 10)));
       if (!force) {
-        const cached = loadCachedReports(state.enemyId, count);
+        const cached = loadCachedReports(state.targetId, count);
         if (cached && cached.length) {
           state.reports = cached;
           buildAnalysisRows();
@@ -635,7 +636,7 @@
       if (!wars.length) {
         state.reports = [];
         buildAnalysisRows();
-        state.warning = 'No completed ranked-war IDs could be discovered for this enemy faction. Historical profiling will be limited until report IDs are available.';
+        state.warning = 'No completed ranked-war IDs could be discovered for the selected faction. Historical profiling will be limited until report IDs are available.';
         return;
       }
 
@@ -655,7 +656,7 @@
 
       state.reports = reports.sort((a, b) => (b.end || b.start) - (a.end || a.start));
       buildAnalysisRows();
-      if (reports.length) saveCachedReports(state.enemyId, count, state.reports);
+      if (reports.length) saveCachedReports(state.targetId, count, state.reports);
 
       if (errors.length) {
         state.warning = `${reports.length}/${wars.length} previous war reports loaded. ${errors.length} report(s) were unavailable.`;
@@ -688,21 +689,27 @@
       if (!state.ownId) throw new Error('Could not detect your faction from this API key.');
 
       const current = detectCurrentWar(own, state.ownId);
-      if (!current) throw new Error('No current or upcoming ranked-war opponent was found.');
-
-      const enemyChanged = num(state.enemyId) !== num(current.enemyId);
       state.currentWar = current;
-      state.enemyId = current.enemyId;
 
-      const enemy = await apiV1(`/faction/${state.enemyId}?selections=basic,rankedwars`);
-      state.enemy = enemy;
-      state.roster = rosterRows(enemy);
+      let nextTargetId = state.ownId;
+      let target = own;
+
+      if (state.scope === 'enemy') {
+        if (!current) throw new Error('No current or upcoming ranked-war opponent was found.');
+        nextTargetId = current.enemyId;
+        target = await apiV1(`/faction/${nextTargetId}?selections=basic,rankedwars`);
+      }
+
+      const targetChanged = num(state.targetId) !== num(nextTargetId);
+      state.targetId = nextTargetId;
+      state.target = target;
+      state.roster = rosterRows(target);
       state.lastScan = Date.now();
 
-      if (enemyChanged || !state.watch) loadWatch(state.enemyId);
+      if (targetChanged || !state.watch) loadWatch(state.targetId);
       recordWatchSnapshot(true);
 
-      if (enemyChanged) {
+      if (targetChanged) {
         state.reports = [];
         state.rows = [];
       } else if (state.reports.length) {
@@ -710,8 +717,11 @@
       } else {
         state.rows = state.roster.map(r => ({
           ...r, eligible:0, active:0, participation:0, totalHits:0, totalScore:0,
-          avg:0, avgWhenActive:0, maxHits:0, activityScore:0,
-          activityClass:'WAITING', activityTone:'grey', activityRank:0, series:[]
+          avg:0, avgWhenActive:0, totalEnergyMin:0, avgEnergyMin:0,
+          avgEnergyActiveMin:0, maxEnergyMin:0, maxHits:0, activityScore:0,
+          activityClass:'WAITING', activityTone:'grey', activityRank:0, series:[],
+          recentAvg:0, trendLabel:'LIMITED', trendTone:'grey', trendDelta:0,
+          olderAvg:0, newRecruit:r.days > 0 && r.days <= 30
         }));
       }
     } catch (e) {
@@ -724,15 +734,15 @@
     if (!state.error && analyze) await analyzeHistory(forceHistory);
   }
 
-  function watchKey(enemyId) { return `prewarWatch:${enemyId}`; }
+  function watchKey(targetId) { return `prewarWatch:${targetId}`; }
 
-  function loadWatch(enemyId) {
-    const w = storageGet(watchKey(enemyId), null);
+  function loadWatch(targetId) {
+    const w = storageGet(watchKey(targetId), null);
     state.watch = w && typeof w === 'object' ? w : { started: Date.now(), lastSample: 0, samples: 0, players: {} };
   }
 
   function saveWatch() {
-    if (state.enemyId && state.watch) storageSet(watchKey(state.enemyId), state.watch);
+    if (state.targetId && state.watch) storageSet(watchKey(state.targetId), state.watch);
   }
 
   function tctBucket(tsMs=Date.now()) {
@@ -746,8 +756,8 @@
   }
 
   function recordWatchSnapshot(force=false) {
-    if (!state.enemyId || !state.roster.length) return;
-    if (!state.watch) loadWatch(state.enemyId);
+    if (!state.targetId || !state.roster.length) return;
+    if (!state.watch) loadWatch(state.targetId);
     const now=Date.now();
     if (!force && now-num(state.watch.lastSample) < WATCH_REFRESH_MS-15000) return;
     state.watch.lastSample=now;
@@ -858,6 +868,7 @@
 .pwi-modal{width:min(560px,100%);max-height:calc(100dvh - 16px);overflow:auto;-webkit-overflow-scrolling:touch;background:#131b16;border:1px solid #46574b;border-radius:11px;padding:11px;color:#fff}.pwi-modal h3{margin:0 0 8px;color:#82ff95}.pwi-modal table{width:100%;border-collapse:collapse;font-size:10px}.pwi-modal th,.pwi-modal td{padding:6px 4px;border-bottom:1px solid #29352d;text-align:left}.pwi-modal th{color:#93a89a}.pwi-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}
 .pwi-keybox{padding:14px}.pwi-keybox input{width:100%;background:#090d0a;color:#fff;border:1px solid #44584a;border-radius:8px;padding:10px;margin:9px 0}.pwi-keynote{font-size:10px;color:#93a399;line-height:1.45}
 
+.pwi-scope{display:flex;gap:5px;padding:5px 7px;background:#0d130f;border-bottom:1px solid #26342b;flex:0 0 auto}.pwi-scopebtn{flex:1;border:1px solid #34473b;background:#141c17;color:#99aa9e;border-radius:8px;padding:8px 6px;font-size:10px;font-weight:900;cursor:pointer}.pwi-scopebtn.active{background:#213529;color:#82ff95;border-color:#5f8d6c}
 .pwi-tabs{display:flex;gap:5px;padding:5px 7px;background:#101611;border-bottom:1px solid #2c3930;flex:0 0 auto}
 .pwi-tab{flex:1;border:1px solid #34473b;background:#151d18;color:#9cad9f;border-radius:7px;padding:7px 6px;font-size:10px;font-weight:900;cursor:pointer}
 .pwi-tab.active{background:#203126;color:#82ff95;border-color:#557561}
@@ -904,10 +915,16 @@
 
   function phaseLabel() {
     const now = nowSec();
-    if (!state.currentWar) return 'NO WAR';
-    if (state.currentWar.start > now) return 'UPCOMING';
-    if (!state.currentWar.end || state.currentWar.end > now) return 'LIVE';
-    return 'ENDED';
+    if (state.scope === 'own') {
+      if (!state.currentWar) return 'MY FACTION';
+      if (state.currentWar.start > now) return 'MY FACTION • UPCOMING WAR';
+      if (!state.currentWar.end || state.currentWar.end > now) return 'MY FACTION • LIVE WAR';
+      return 'MY FACTION';
+    }
+    if (!state.currentWar) return 'ENEMY • NO WAR';
+    if (state.currentWar.start > now) return 'ENEMY • UPCOMING';
+    if (!state.currentWar.end || state.currentWar.end > now) return 'ENEMY • LIVE';
+    return 'ENEMY';
   }
 
   function keyScreen() {
@@ -925,12 +942,12 @@
 
   function helpHtml() {
     return `<div class="pwi-help">
-      <div class="pwi-helpbox"><h3>☣ WHAT v3 IS FOR</h3><p>This is an enemy <b>war-behavior profile</b>. It uses completed ranked-war reports plus activity observations collected by this device after matchmaking.</p></div>
+      <div class="pwi-helpbox"><h3>☣ WHAT v3 IS FOR</h3><p>This profiles <b>your faction or your current ranked-war enemy</b> using the same measurements, so you can judge your own war readiness and compare it with the opposition.</p></div>
       <div class="pwi-helpbox"><h3>THE FIVE TABS</h3><div class="pwi-helpgrid">
-        <div class="pwi-helpitem"><b>WAR PROFILE</b><span>Faction-level answer: how many serious hitters they normally use, whether they are top-heavy, deep, inconsistent, heating up, and how concentrated their attack production is.</span></div>
+        <div class="pwi-helpitem"><b>WAR PROFILE</b><span>Faction-level answer: how many serious hitters the selected faction normally uses, whether it is top-heavy, deep, inconsistent, heating up, and how concentrated its attack production is.</span></div>
         <div class="pwi-helpitem"><b>WAR TEAM</b><span>Current members grouped into Core, Regular, Occasional, Low, and Unknown/New.</span></div>
         <div class="pwi-helpitem"><b>MEMBERS</b><span>Individual historical participation, average hits, recent trend, and last five analyzed wars.</span></div>
-        <div class="pwi-helpitem"><b>PRE-WAR WATCH</b><span>Local observations made while Torn/TornPDA is running. It estimates when current members tend to be active in Torn City Time. This is not proof of war-hit timing.</span></div>
+        <div class="pwi-helpitem"><b>PRE-WAR WATCH</b><span>Local observations made while Torn/TornPDA is running. It estimates when the selected faction’s current members tend to be active in Torn City Time. This is not proof of war-hit timing.</span></div>
         <div class="pwi-helpitem"><b>HOW TO READ</b><span>This explanation screen.</span></div>
       </div></div>
       <div class="pwi-helpbox"><h3>IMPORTANT NUMBERS</h3><div class="pwi-helpgrid">
@@ -950,7 +967,7 @@
     const m=factionMetrics();
     if (!state.reports.length) return `<div class="pwi-section"><h3>WAR PROFILE</h3><p>${state.analyzing ? esc(state.progress) : 'No completed war reports loaded yet. Tap RESCAN HISTORY.'}</p></div>`;
     const top=m.byHits[0];
-    return `<div class="pwi-section"><h3>☣ ENEMY WAR PROFILE</h3>
+    return `<div class="pwi-section"><h3>☣ ${state.scope==='own'?'MY FACTION WAR PROFILE':'ENEMY WAR PROFILE'}</h3>
       <div class="pwi-badge-row"><span class="pwi-pill tone-${m.quality[1]}">DATA ${m.quality[0]}</span><span class="pwi-pill tone-blue">${state.reports.length} WARS READ</span><span class="pwi-pill tone-purple">${m.unknown} UNKNOWN CURRENT MEMBERS</span></div>
       <div class="pwi-kpis" style="margin-top:7px">
         <div class="pwi-kpi"><span>LIKELY CORE</span><b>${m.coreRows.length}</b></div>
@@ -962,15 +979,15 @@
         <div class="pwi-kpi"><span>WINS IN DATA</span><b>${state.reports.filter(r=>['W','L'].includes(r.result)).length ? `${Math.round(m.winPct)}%` : '—'}</b></div>
       </div>
     </div>
-    <div class="pwi-section"><h3>HOW THEY APPEAR TO WAR</h3>${m.styles.map(s=>`<div class="pwi-style"><span class="pwi-pill tone-${s.tone}">${esc(s.label)}</span><span>${esc(s.why)}</span></div>`).join('')}</div>
-    <div class="pwi-section"><h3>ATTACK CONCENTRATION — CURRENT ROSTER HISTORY</h3><p>How much of the loaded current-member attack production comes from their top hitters.</p>
+    <div class="pwi-section"><h3>${state.scope==='own'?'HOW WE APPEAR TO WAR':'HOW THEY APPEAR TO WAR'}</h3>${m.styles.map(s=>`<div class="pwi-style"><span class="pwi-pill tone-${s.tone}">${esc(s.label)}</span><span>${esc(s.why)}</span></div>`).join('')}</div>
+    <div class="pwi-section"><h3>ATTACK CONCENTRATION — CURRENT ROSTER HISTORY</h3><p>How much of the loaded current-member attack production comes from the selected faction’s top hitters.</p>
       <div class="pwi-conc">${[[3,m.top3],[5,m.top5],[10,m.top10],[15,m.top15]].map(([n,v])=>`<div class="pwi-barline"><b>Top ${n}</b><div class="pwi-track"><div class="pwi-fill" style="width:${Math.min(100,v)}%"></div></div><b>${Math.round(v)}%</b></div>`).join('')}</div>
       ${top ? `<div class="pwi-note">Top historical current-roster contributor: <b>${esc(top.name)}</b> — ${top.totalHits} attacks across the loaded reports.</div>`:''}
       <div class="pwi-note"><b>Estimated minimum energy:</b> recorded attacks × 25E. It is intentionally labelled minimum because the public ranked-war report does not prove every failed attack/assist expenditure, and Revitalize can refund attack energy.</div>
     </div>
     <div class="pwi-section"><h3>RECENT FACTION FORM</h3>
       <div class="pwi-kpis"><div class="pwi-kpi"><span>LAST 3 AVG ATTACKS</span><b>${fmtNum(m.recentAttacks,0)}</b></div><div class="pwi-kpi"><span>OLDER AVG ATTACKS</span><b>${m.olderAttacks?fmtNum(m.olderAttacks,0):'—'}</b></div><div class="pwi-kpi"><span>LAST 3 ACTIVE MEMBERS</span><b>${fmtNum(m.recentActive,1)}</b></div><div class="pwi-kpi"><span>OLDER ACTIVE MEMBERS</span><b>${m.olderActive?fmtNum(m.olderActive,1):'—'}</b></div></div>
-      <div class="pwi-note">These figures only count players who are in the enemy faction <b>now</b>. That makes the profile more useful for the upcoming matchup, but older wars can undercount if much of today's roster joined later.</div>
+      <div class="pwi-note">These figures only count players who are in the selected faction <b>now</b>. Older wars can undercount if much of today's roster joined later.</div>
     </div>`;
   }
 
@@ -1015,21 +1032,22 @@
     const samples=num(state.watch?.samples);
     const started=state.watch?.started ? new Date(state.watch.started).toLocaleString() : 'Not started';
     const sorted=state.rows.slice().sort((a,b)=>watchFor(b.id).activePct-watchFor(a.id).activePct || b.activityScore-a.activityScore);
-    return `<div class="pwi-section"><h3>🕒 PRE-WAR WATCH</h3><p>This tab records current enemy Last Action snapshots every ~5 minutes while Torn is allowed to run this userscript. It is <b>observed general Torn activity</b>, not historical proof of when they make war attacks.</p><div class="pwi-badge-row"><span class="pwi-pill tone-blue">${samples} SNAPSHOTS</span><span class="pwi-pill tone-grey">STARTED ${esc(started)}</span></div></div>
+    return `<div class="pwi-section"><h3>🕒 PRE-WAR WATCH</h3><p>This tab records current member Last Action snapshots every ~5 minutes for the selected faction while Torn is allowed to run this userscript. It is <b>observed general Torn activity</b>, not historical proof of when they make war attacks.</p><div class="pwi-badge-row"><span class="pwi-pill tone-blue">${samples} SNAPSHOTS</span><span class="pwi-pill tone-grey">STARTED ${esc(started)}</span></div></div>
       <div class="pwi-section"><h3>FACTION ACTIVITY BY TCT WINDOW</h3><div class="pwi-watchgrid">${buckets.map(b=>`<div class="pwi-hour"><div class="pwi-hour-top"><b>${b.label}</b><span>${b.total?`${Math.round(b.activePct)}% observed active`:'No samples'}</span></div><div class="pwi-hourbar"><div class="pwi-hourfill" style="width:${Math.min(100,b.activePct)}%"></div></div></div>`).join('') || '<div class="pwi-muted">No watch data yet.</div>'}</div></div>
       <div class="pwi-section"><h3>MEMBER WATCH</h3>${sorted.map(r=>{const w=watchFor(r.id),t=threatFor(r);return `<div class="pwi-mini"><div class="pwi-mini-top"><div class="pwi-mini-name">${esc(r.name)} [${r.id}]</div><span class="pwi-pill tone-${t.tone}">${esc(t.label)}</span><button class="pwi-btn" data-detail="${r.id}">DETAILS</button></div><div class="pwi-mini-meta">Observed ${w.total}× • active ≤20m in ${w.total?Math.round(w.activePct):0}% of samples • best: ${w.best.length?w.best.map(x=>`${x.label} ${Math.round(x.activePct)}%`).join(' / '):'not enough samples'}</div></div>`}).join('')}</div>`;
   }
 
   function keyScreen() {
-    return `<div id="${UI}-panel"><div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">☣ WRATH PRE-WAR INTEL • v${VERSION}</div><div class="pwi-sub">ENEMY WAR PROFILE</div></div><button class="pwi-btn" data-act="close">✕</button></div><div class="pwi-keybox"><h3 style="color:#82ff95;margin:0 0 6px">Torn API Key</h3><div class="pwi-keynote">The key is saved on this device and used only for Torn API calls. No external server is used.</div><input id="pwi-key" type="password" placeholder="Paste Torn API key"><button class="pwi-btn" data-act="savekey">SAVE KEY & BUILD PROFILE</button></div></div>`;
+    return `<div id="${UI}-panel"><div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">☣ WRATH PRE-WAR INTEL • v${VERSION}</div><div class="pwi-sub">MY FACTION + ENEMY WAR PROFILE</div></div><button class="pwi-btn" data-act="close">✕</button></div><div class="pwi-keybox"><h3 style="color:#82ff95;margin:0 0 6px">Torn API Key</h3><div class="pwi-keynote">The key is saved on this device and used only for Torn API calls. No external server is used.</div><input id="pwi-key" type="password" placeholder="Paste Torn API key"><button class="pwi-btn" data-act="savekey">SAVE KEY & BUILD PROFILE</button></div></div>`;
   }
 
   function panelHtml() {
     if (!state.apiKey) return keyScreen();
-    const enemyName=currentFactionName(state.enemy||{}), tag=currentFactionTag(state.enemy||{});
+    const factionName=currentFactionName(state.target||{}), tag=currentFactionTag(state.target||{});
     const body = state.view==='profile' ? profileHtml() : state.view==='team' ? teamHtml() : state.view==='members' ? memberCardsHtml() : state.view==='watch' ? watchHtml() : helpHtml();
-    return `<div id="${UI}-panel"><div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">☣ WRATH PRE-WAR INTEL • v${VERSION}</div><div class="pwi-sub">${phaseLabel()} • ${esc(enemyName)} ${tag?`[${esc(tag)}]`:''} • ${esc(state.analyzing?state.progress:(state.progress||'READY'))}</div></div><button class="pwi-btn" data-act="scan" ${state.loading||state.analyzing?'disabled':''}>${state.loading?'SCANNING…':'SCAN'}</button><button class="pwi-btn" data-act="close">✕</button></div>
+    return `<div id="${UI}-panel"><div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">☣ WRATH PRE-WAR INTEL • v${VERSION}</div><div class="pwi-sub">${phaseLabel()} • ${esc(factionName)} ${tag?`[${esc(tag)}]`:''} • ${esc(state.analyzing?state.progress:(state.progress||'READY'))}</div></div><button class="pwi-btn" data-act="scan" ${state.loading||state.analyzing?'disabled':''}>${state.loading?'SCANNING…':'SCAN'}</button><button class="pwi-btn" data-act="close">✕</button></div>
       ${state.error?`<div class="pwi-error"><b>ERROR:</b> ${esc(state.error)}</div>`:''}${state.warning?`<div class="pwi-warn">${esc(state.warning)}</div>`:''}
+      <div class="pwi-scope"><button class="pwi-scopebtn ${state.scope==='own'?'active':''}" data-scope="own">🏠 MY FACTION</button><button class="pwi-scopebtn ${state.scope==='enemy'?'active':''}" data-scope="enemy">🎯 ENEMY</button></div>
       <div class="pwi-tabs">${[['profile','WAR PROFILE'],['team','WAR TEAM'],['members','MEMBERS'],['watch','PRE-WAR WATCH'],['help','HOW TO READ']].map(([v,l])=>`<button class="pwi-tab ${state.view===v?'active':''}" data-view="${v}">${l}</button>`).join('')}</div>
       ${state.view==='members'?`<div class="pwi-toolbar"><input id="pwi-search" value="${esc(state.filter)}" placeholder="Search member / ID / role…"><select id="pwi-sort"><option value="activityScore"${state.sort==='activityScore'?' selected':''}>War activity</option><option value="participation"${state.sort==='participation'?' selected':''}>Participation %</option><option value="avg"${state.sort==='avg'?' selected':''}>Avg hits</option><option value="totalHits"${state.sort==='totalHits'?' selected':''}>Total hits</option><option value="recent"${state.sort==='recent'?' selected':''}>Last war hits</option><option value="live"${state.sort==='live'?' selected':''}>Current activity</option><option value="level"${state.sort==='level'?' selected':''}>Level</option></select></div>`:''}
       <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><select id="pwi-count" style="width:auto;background:#090d0a;color:#fff;border:1px solid #415247;border-radius:7px;padding:7px;font-size:10px">${[5,10,15,20].map(n=>`<option value="${n}"${state.historyCount===n?' selected':''}>Past ${n} wars</option>`).join('')}</select><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>RESCAN HISTORY</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
@@ -1123,7 +1141,7 @@
     const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `wrath-prewar-intel-${state.enemyId || 'enemy'}-${Date.now()}.csv`;
+    a.download = `wrath-war-intel-${state.scope}-${state.targetId || 'faction'}-${Date.now()}.csv`;
     a.click();
     setTimeout(()=>URL.revokeObjectURL(a.href),5000);
   }
@@ -1131,6 +1149,16 @@
   function bindUi() {
     const p=document.getElementById(`${UI}-panel`); if(!p) return;
     p.querySelector('[data-act="close"]')?.addEventListener('click',()=>{state.open=false;render();});
+    p.querySelectorAll('[data-scope]').forEach(btn=>btn.addEventListener('click',()=>{
+      const next = btn.dataset.scope === 'enemy' ? 'enemy' : 'own';
+      if (next === state.scope) return;
+      state.scope = next;
+      storageSet('prewarScope', state.scope);
+      state.target = null; state.targetId = 0; state.reports = []; state.rows = []; state.watch = null;
+      state.error = ''; state.warning = ''; state.progress = ''; state.view = 'profile';
+      render();
+      scanBase({analyze:true,forceHistory:false});
+    }));
     p.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('click',()=>{state.view=btn.dataset.view||'profile';render();}));
     p.querySelector('[data-act="scan"]')?.addEventListener('click',()=>scanBase({analyze:true,forceHistory:false}));
     p.querySelector('[data-act="history"]')?.addEventListener('click',()=>analyzeHistory(true));
@@ -1144,17 +1172,24 @@
   }
 
   async function liveRefresh() {
-    if (!state.apiKey || !state.enemyId || state.loading || state.analyzing) return;
+    if (!state.apiKey || !state.targetId || state.loading || state.analyzing) return;
     try {
-      const enemy=await apiV1(`/faction/${state.enemyId}?selections=basic,rankedwars`);
-      state.enemy=enemy; state.roster=rosterRows(enemy); if(!state.watch)loadWatch(state.enemyId); recordWatchSnapshot(false);
-      if(state.reports.length)buildAnalysisRows(); state.lastScan=Date.now(); if(state.open)render();
-    } catch(_) {}
+      const target = state.scope === 'own'
+        ? await apiV1('/faction/?selections=basic,rankedwars')
+        : await apiV1(`/faction/${state.targetId}?selections=basic,rankedwars`);
+      state.target = target;
+      state.roster = rosterRows(target);
+      if (!state.watch) loadWatch(state.targetId);
+      recordWatchSnapshot(false);
+      if (state.reports.length) buildAnalysisRows();
+      state.lastScan = Date.now();
+      if (state.open) render();
+    } catch (_) {}
   }
 
   async function backgroundWatch() {
     if (!state.apiKey) return;
-    if (!state.enemyId) { await scanBase({analyze:false,forceHistory:false}); return; }
+    if (!state.targetId) { await scanBase({analyze:false,forceHistory:false}); return; }
     await liveRefresh();
   }
 
