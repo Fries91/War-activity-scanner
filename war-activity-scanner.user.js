@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         WRATH War Intelligence - Auto Update
+// @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
 // @version      3.5.1
-// @description  WRATH War Intelligence with exact war selection, stable Torn header spy icon, automatic updates, and TornPDA selector exit fix.
+// @description  PDA-first war intelligence with exact war selection, faction/enemy comparison, stable Torn header spy icon, energy estimates, trends, and automatic script updates.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
@@ -12,62 +12,1442 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
-// @connect      raw.githubusercontent.com
 // @connect      api.torn.com
+// @connect      raw.githubusercontent.com
 // @run-at       document-idle
 // ==/UserScript==
 
-(async () => {
+(function () {
   'use strict';
   if (window.top !== window.self) return;
 
+  const UI = 'wrathPreWarIntel';
+  const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
+  const API = 'https://api.torn.com';
   const VERSION = '3.5.1';
-  const CACHE_KEY = `wrath-war-intel-payload-${VERSION}`;
-  const BASE = 'https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/';
-  const PARTS = [1,2,3,4,5].map(n => `${BASE}war-activity-scanner.v3.5.payload.${n}.txt?v=3.5.0`);
+  const BUILD = 'WAR-SELECTOR-PDA-EXIT-FIX-20260820';
+  const LIVE_REFRESH_MS = 90_000;
+  const WATCH_REFRESH_MS = 5 * 60_000;
+  const REDISCOVER_MS = 30 * 60_000;
+  const HISTORY_CACHE_MS = 30 * 60_000;
 
-  function getText(url) {
-    return new Promise((resolve, reject) => {
-      GM_xmlhttpRequest({
-        method: 'GET', url, timeout: 20000,
-        onload: r => r.status >= 200 && r.status < 300 ? resolve(r.responseText || '') : reject(new Error(`Payload HTTP ${r.status}`)),
-        onerror: () => reject(new Error('Could not download WRATH War Intelligence payload.')),
-        ontimeout: () => reject(new Error('WRATH War Intelligence payload request timed out.'))
-      });
+  const state = {
+    open: false,
+    loading: false,
+    analyzing: false,
+    progress: '',
+    apiKey: '',
+    me: null,
+    ownFaction: null,
+    ownId: 0,
+    target: null,
+    targetId: 0,
+    scope: storageGet('prewarScope', 'own') === 'enemy' ? 'enemy' : 'own',
+    currentWar: null,
+    roster: [],
+    reports: [],
+    rows: [],
+    availableWars: [],
+    selectedWarIds: [],
+    warCatalogLimit: 30,
+    sort: 'activityScore',
+    filter: '',
+    view: 'profile',
+    watch: null,
+    watchTimer: null,
+    rediscoverTimer: null,
+    error: '',
+    warning: '',
+    lastScan: 0,
+    timer: null,
+  };
+
+  function nowSec() { return Math.floor(Date.now() / 1000); }
+
+  function storageGet(key, fallback = '') {
+    try {
+      if (typeof GM_getValue === 'function') return GM_getValue(`${STORE}:${key}`, fallback);
+    } catch (_) {}
+    try {
+      const v = localStorage.getItem(`${STORE}:${key}`);
+      return v == null ? fallback : JSON.parse(v);
+    } catch (_) { return fallback; }
+  }
+
+  function storageSet(key, value) {
+    try {
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(`${STORE}:${key}`, value);
+        return;
+      }
+    } catch (_) {}
+    try { localStorage.setItem(`${STORE}:${key}`, JSON.stringify(value)); } catch (_) {}
+  }
+
+  function esc(v) {
+    return String(v ?? '')
+      .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  function num(v, fallback = 0) {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : fallback;
+  }
+
+  function fmtNum(v, decimals = 0) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return '—';
+    return n.toLocaleString(undefined, {
+      minimumFractionDigits: decimals,
+      maximumFractionDigits: decimals
     });
   }
 
-  function installPdaSelectorFix() {
-    if (document.getElementById('wrath-war-selector-exit-fix')) return;
-    const style = document.createElement('style');
-    style.id = 'wrath-war-selector-exit-fix';
-    style.textContent = `
-      .pwi-shade .pwi-modal{max-height:calc(100dvh - 12px)!important;overscroll-behavior:contain!important}
-      .pwi-shade .pwi-modal>.pwi-actions:last-child{position:sticky!important;bottom:0!important;z-index:80!important;background:#131b16!important;margin:8px -11px -11px!important;padding:10px 11px calc(12px + env(safe-area-inset-bottom,0px))!important;border-top:1px solid #46574b!important;box-shadow:0 -7px 16px #000b!important}
-      .pwi-shade .pwi-modal>.pwi-actions:last-child .pwi-btn{min-height:40px!important}
-      .pwi-shade .pwi-modal>.pwi-actions:last-child [data-ws="apply"]{background:#24452d!important;border-color:#64a674!important;color:#a2ffb1!important}
-      .pwi-shade .pwi-warselect-list{padding-bottom:72px!important}
-    `;
-    (document.head || document.documentElement).appendChild(style);
+  function fmtDate(ts) {
+    if (!ts) return 'Unknown date';
+    try {
+      return new Date(Number(ts) * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: '2-digit' });
+    } catch (_) { return 'Unknown date'; }
   }
 
-  try {
-    let b64 = GM_getValue(CACHE_KEY, '');
-    if (!b64 || b64.length < 25000) {
-      const pieces = await Promise.all(PARTS.map(getText));
-      b64 = pieces.join('').replace(/\s+/g, '');
-      if (b64.length < 25000) throw new Error('Downloaded payload was incomplete.');
-      GM_setValue(CACHE_KEY, b64);
+  function requestJson(url) {
+    return new Promise((resolve, reject) => {
+      const finish = (txt, status = 200) => {
+        if (status < 200 || status >= 300) return reject(new Error(`HTTP ${status}`));
+        try {
+          const data = JSON.parse(txt);
+          if (data && data.error) {
+            const e = data.error;
+            return reject(new Error(`Torn API ${e.code ?? ''}: ${e.error || e.message || 'Unknown error'}`));
+          }
+          resolve(data);
+        } catch (_) {
+          reject(new Error('Torn API returned invalid JSON.'));
+        }
+      };
+
+      if (typeof GM_xmlhttpRequest === 'function') {
+        try {
+          GM_xmlhttpRequest({
+            method: 'GET',
+            url,
+            timeout: 20000,
+            onload: r => finish(r.responseText, r.status),
+            onerror: () => reject(new Error('Could not reach Torn API.')),
+            ontimeout: () => reject(new Error('Torn API request timed out.')),
+          });
+          return;
+        } catch (_) {}
+      }
+
+      fetch(url, { credentials: 'omit', cache: 'no-store' })
+        .then(r => r.text().then(t => finish(t, r.status)))
+        .catch(() => reject(new Error('Could not reach Torn API.')));
+    });
+  }
+
+  function apiV1(path) {
+    const sep = path.includes('?') ? '&' : '?';
+    return requestJson(`${API}${path}${sep}key=${encodeURIComponent(state.apiKey)}`);
+  }
+
+  function apiV2(path) {
+    const sep = path.includes('?') ? '&' : '?';
+    return requestJson(`${API}/v2${path}${sep}key=${encodeURIComponent(state.apiKey)}`);
+  }
+
+  function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+  function getFactionIdFromProfile(profile) {
+    return num(profile?.faction?.faction_id || profile?.faction?.id || profile?.faction_id || profile?.faction?.ID);
+  }
+
+  function memberEntries(data) {
+    const m = data?.members || data?.basic?.members || [];
+    if (Array.isArray(m)) {
+      return m.map(x => [String(x?.id || x?.player_id || x?.user_id || 0), x]).filter(([id]) => id !== '0');
+    }
+    if (m && typeof m === 'object') return Object.entries(m);
+    return [];
+  }
+
+  function getWars(data) {
+    const rw = data?.rankedwars || data?.ranked_wars || data?.wars || [];
+    if (Array.isArray(rw)) {
+      return rw.map((x, i) => [String(x?.id || x?.war_id || x?.ranked_war_id || i), x]);
+    }
+    return Object.entries(rw || {});
+  }
+
+  function warStart(rw) {
+    return num(rw?.war?.start || rw?.start || rw?.start_timestamp || rw?.started_at || rw?.timestamp_start);
+  }
+
+  function warEnd(rw) {
+    return num(rw?.war?.end || rw?.end || rw?.end_timestamp || rw?.ended_at || rw?.timestamp_end);
+  }
+
+  function warFactions(rw) {
+    return rw?.factions || rw?.participants || rw?.faction || {};
+  }
+
+  function factionEntries(factions) {
+    if (Array.isArray(factions)) {
+      return factions.map(f => [String(f?.id || f?.faction_id || 0), f]).filter(([id]) => id !== '0');
+    }
+    if (factions && typeof factions === 'object') return Object.entries(factions);
+    return [];
+  }
+
+  function detectCurrentWar(data, ownFactionId) {
+    const now = nowSec();
+    const wars = getWars(data).map(([id, rw]) => ({
+      id: String(id),
+      rw,
+      start: warStart(rw),
+      end: warEnd(rw),
+    })).filter(w => w.id);
+
+    wars.sort((a, b) => (b.start || 0) - (a.start || 0));
+
+    let chosen = wars.find(w => w.start && w.start <= now && (!w.end || w.end > now));
+    if (!chosen) {
+      const upcoming = wars
+        .filter(w => w.start > now && (!w.end || w.end >= w.start))
+        .sort((a, b) => a.start - b.start);
+      chosen = upcoming[0];
+    }
+    if (!chosen) return null;
+
+    const entries = factionEntries(warFactions(chosen.rw));
+    const enemy = entries.find(([id]) => num(id) !== num(ownFactionId));
+    if (!enemy) return null;
+
+    return {
+      ...chosen,
+      enemyId: num(enemy[0]),
+      factions: entries,
+    };
+  }
+
+  function currentFactionName(data) {
+    return data?.name || data?.basic?.name || data?.faction?.name || 'Faction';
+  }
+
+  function currentFactionTag(data) {
+    return data?.tag || data?.basic?.tag || data?.faction?.tag || '';
+  }
+
+  function lastActionAge(member) {
+    const ts = num(member?.last_action?.timestamp || member?.last_action_timestamp);
+    if (ts) return Math.max(0, nowSec() - ts);
+
+    const rel = String(member?.last_action?.relative || '').toLowerCase();
+    if (rel.includes('now') || rel.includes('online')) return 0;
+    const n = parseInt(rel, 10);
+    if (!Number.isFinite(n)) return 999999999;
+    if (rel.includes('minute')) return n * 60;
+    if (rel.includes('hour')) return n * 3600;
+    if (rel.includes('day')) return n * 86400;
+    return 999999999;
+  }
+
+  function liveLabel(member) {
+    const age = lastActionAge(member);
+    if (age <= 120) return ['ONLINE', 'green'];
+    if (age <= 20 * 60) return ['≤20m', 'green'];
+    if (age <= 60 * 60) return ['≤1h', 'yellow'];
+    if (age <= 4 * 3600) return ['≤4h', 'orange'];
+    return ['OFFLINE', 'grey'];
+  }
+
+  function rosterRows(enemy) {
+    return memberEntries(enemy).map(([id, m]) => {
+      const [live, liveTone] = liveLabel(m);
+      return {
+        id: num(id),
+        name: m?.name || `Player ${id}`,
+        level: num(m?.level),
+        position: m?.position || m?.faction_position || '—',
+        days: num(m?.days_in_faction),
+        lastRelative: m?.last_action?.relative || '—',
+        lastAge: lastActionAge(m),
+        live,
+        liveTone,
+        state: String(m?.status?.state || m?.status?.description || m?.status || 'Unknown'),
+      };
+    });
+  }
+
+  function getCompletedTargetWars(targetData) {
+    const now = nowSec();
+    return getWars(targetData)
+      .map(([id, rw]) => ({
+        id: String(id),
+        rw,
+        start: warStart(rw),
+        end: warEnd(rw),
+      }))
+      .filter(w => w.id && w.end && w.end <= now)
+      .sort((a, b) => (b.end || b.start || 0) - (a.end || a.start || 0));
+  }
+
+
+  function parseRankIdsFromNews(data) {
+    const news = data?.mainnews || data?.news || {};
+    const entries = Array.isArray(news) ? news : Object.values(news || {});
+    const out = [];
+    for (const item of entries) {
+      const text = String(item?.news || item?.text || item?.message || '');
+      const ts = num(item?.timestamp || item?.time);
+      const matches = [...text.matchAll(/rankID=(\d+)/gi)];
+      for (const m of matches) out.push({ id: String(m[1]), start: 0, end: ts || 1, rw: null, source: 'news' });
+    }
+    return { wars: out, entries };
+  }
+
+  async function discoverCompletedWars(count) {
+    const base = getCompletedTargetWars(state.target);
+    const seen = new Set(base.map(w => String(w.id)));
+    const wars = base.slice();
+    if (wars.length >= count) return wars.slice(0, count);
+
+    // Fallback: faction main news contains ranked-war result links with rankID.
+    // This lets the script discover old report IDs when the basic response only exposes the current war.
+    let to = 0;
+    for (let page = 0; page < 12 && wars.length < count; page++) {
+      try {
+        const suffix = to ? `&to=${to}` : '';
+        const data = await apiV1(`/faction/${state.targetId}?selections=mainnews${suffix}`);
+        const parsed = parseRankIdsFromNews(data);
+        if (!parsed.entries.length) break;
+        for (const w of parsed.wars) {
+          if (!seen.has(w.id) && String(state.currentWar?.id || '') !== String(w.id)) {
+            seen.add(w.id);
+            wars.push(w);
+          }
+        }
+        const stamps = parsed.entries.map(x => num(x?.timestamp || x?.time)).filter(Boolean);
+        if (!stamps.length) break;
+        const oldest = Math.min(...stamps);
+        if (!oldest || oldest >= to && to) break;
+        to = oldest - 1;
+        await sleep(120);
+      } catch (_) {
+        break;
+      }
+    }
+    return wars.sort((a,b)=>(b.end||b.start||0)-(a.end||a.start||0)).slice(0,count);
+  }
+
+  function normalizeReport(data, targetId, fallbackWar) {
+    const rr = data?.rankedwarreport || data?.ranked_war_report || data?.report || data;
+    const factions = factionEntries(rr?.factions || rr?.participants || {});
+    let targetEntry = factions.find(([id, f]) => num(id) === num(targetId) || num(f?.id || f?.faction_id) === num(targetId));
+    if (!targetEntry) return null;
+
+    const [fKey, f] = targetEntry;
+    const rawMembers = f?.members || [];
+    const members = [];
+
+    if (Array.isArray(rawMembers)) {
+      rawMembers.forEach(m => {
+        const id = num(m?.id || m?.player_id || m?.user_id);
+        if (!id) return;
+        members.push({
+          id,
+          name: m?.name || `Player ${id}`,
+          level: num(m?.level),
+          attacks: num(m?.attacks || m?.hits || m?.war_hits),
+          score: num(m?.score || m?.respect || m?.war_score),
+        });
+      });
+    } else if (rawMembers && typeof rawMembers === 'object') {
+      Object.entries(rawMembers).forEach(([idRaw, m]) => {
+        const id = num(m?.id || m?.player_id || m?.user_id || idRaw);
+        if (!id) return;
+        members.push({
+          id,
+          name: m?.name || `Player ${id}`,
+          level: num(m?.level),
+          attacks: num(m?.attacks || m?.hits || m?.war_hits),
+          score: num(m?.score || m?.respect || m?.war_score),
+        });
+      });
     }
 
-    if (typeof DecompressionStream !== 'function') throw new Error('This TornPDA/WebView version does not support script decompression.');
-    const bytes = Uint8Array.from(atob(b64), c => c.charCodeAt(0));
-    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream('gzip'));
-    const code = await new Response(stream).text();
-    (0, eval)(code);
-    installPdaSelectorFix();
-  } catch (err) {
-    console.error('WRATH War Intelligence failed to start:', err);
-    alert(`WRATH War Intelligence could not start.\n\n${err?.message || err}`);
+    const other = factions.find(([id, x]) => num(id) !== num(targetId));
+    const war = rr?.war || {};
+    const start = num(war?.start || rr?.start || fallbackWar?.start);
+    const end = num(war?.end || rr?.end || fallbackWar?.end);
+    const winner = num(war?.winner || rr?.winner);
+    const targetScore = num(f?.score);
+    const otherScore = num(other?.[1]?.score);
+
+    let result = '—';
+    if (winner) result = winner === num(targetId) ? 'W' : 'L';
+    else if (targetScore || otherScore) result = targetScore > otherScore ? 'W' : targetScore < otherScore ? 'L' : 'D';
+
+    return {
+      id: String(fallbackWar?.id || rr?.id || ''),
+      start,
+      end,
+      result,
+      targetScore,
+      otherScore,
+      opponentId: num(other?.[0] || other?.[1]?.id || other?.[1]?.faction_id),
+      opponentName: other?.[1]?.name || 'Opponent',
+      members,
+    };
   }
+
+  async function fetchRankedWarReport(war) {
+    let firstErr = null;
+    try {
+      const data = await apiV2(`/faction/${encodeURIComponent(war.id)}/rankedwarreport`);
+      const normalized = normalizeReport(data, state.targetId, war);
+      if (normalized) return normalized;
+      firstErr = new Error('v2 report did not contain selected faction member data.');
+    } catch (e) {
+      firstErr = e;
+    }
+
+    try {
+      const data = await apiV1(`/torn/${encodeURIComponent(war.id)}?selections=rankedwarreport`);
+      const normalized = normalizeReport(data, state.targetId, war);
+      if (normalized) return normalized;
+      throw new Error('v1 report did not contain selected faction member data.');
+    } catch (e) {
+      throw new Error(`War ${war.id}: ${e?.message || firstErr?.message || 'report unavailable'}`);
+    }
+  }
+
+  function selectedWarsKey(targetId) { return `selectedWarIds:${targetId}`; }
+
+  function loadSelectedWarIds(targetId) {
+    const raw = storageGet(selectedWarsKey(targetId), []);
+    return Array.isArray(raw) ? raw.map(String).filter(Boolean) : [];
+  }
+
+  function saveSelectedWarIds(targetId, ids) {
+    const clean = [...new Set((ids || []).map(String).filter(Boolean))];
+    state.selectedWarIds = clean;
+    storageSet(selectedWarsKey(targetId), clean);
+  }
+
+  function reportCacheKey(targetId, warId) { return `reportByWar:${targetId}:${warId}`; }
+  function loadReportByWar(targetId, warId) { return storageGet(reportCacheKey(targetId, warId), null); }
+  function saveReportByWar(targetId, warId, report) { storageSet(reportCacheKey(targetId, warId), report); }
+
+  function opponentFromWarObject(rw, targetId) {
+    const entries = factionEntries(warFactions(rw || {}));
+    const other = entries.find(([id, f]) => num(id) !== num(targetId));
+    return { id: num(other?.[0] || other?.[1]?.id || other?.[1]?.faction_id), name: other?.[1]?.name || '' };
+  }
+
+  function historyCacheKey(targetId, count) {
+    return `prewarHistoryCache:${targetId}:${count}`;
+  }
+
+  function serializeReports(reports) {
+    return reports.map(r => ({
+      id: r.id, start: r.start, end: r.end, result: r.result,
+      targetScore: r.targetScore, otherScore: r.otherScore,
+      opponentId: r.opponentId, opponentName: r.opponentName,
+      members: r.members,
+    }));
+  }
+
+  function loadCachedReports(targetId, count) {
+    const c = storageGet(historyCacheKey(targetId, count), null);
+    if (!c || !Array.isArray(c.reports) || !c.at) return null;
+    if (Date.now() - Number(c.at) > HISTORY_CACHE_MS) return null;
+    return c.reports;
+  }
+
+  function saveCachedReports(targetId, count, reports) {
+    storageSet(historyCacheKey(targetId, count), {
+      at: Date.now(),
+      reports: serializeReports(reports)
+    });
+  }
+
+  function classifyActivity(eligible, active, avg, maxHits, participation, score) {
+    if (!eligible) return { label: 'NO HISTORY', tone: 'grey', rank: 0 };
+    if (eligible === 1) {
+      if (active && avg >= 15) return { label: '1-WAR ACTIVE', tone: 'orange', rank: 3 };
+      if (active) return { label: 'LIMITED DATA', tone: 'yellow', rank: 2 };
+      return { label: '1-WAR LOW', tone: 'grey', rank: 1 };
+    }
+    if (participation >= 80 && avg >= 15) return { label: 'WAR CORE', tone: 'red', rank: 6 };
+    if ((participation >= 70 && avg >= 10) || avg >= 20) return { label: 'VERY ACTIVE', tone: 'orange', rank: 5 };
+    if (participation >= 50 || avg >= 8) return { label: 'ACTIVE', tone: 'yellow', rank: 4 };
+    if (active > 0 || maxHits > 0) return { label: 'OCCASIONAL', tone: 'blue', rank: 3 };
+    return { label: 'LOW / 0-HIT', tone: 'grey', rank: 1 };
+  }
+
+  function trendForSeries(series) {
+    const known = (series || []).filter(v => v !== null);
+    if (known.length < 3) return { label: 'LIMITED', tone: 'grey', delta: 0, recent: known[0] ?? 0, older: 0 };
+    const recent = known.slice(0, Math.min(3, known.length));
+    const older = known.slice(3, 10);
+    const recentAvg = recent.reduce((a,b)=>a+b,0) / recent.length;
+    if (!older.length) return { label: 'NEW HISTORY', tone: 'blue', delta: 0, recent: recentAvg, older: 0 };
+    const olderAvg = older.reduce((a,b)=>a+b,0) / older.length;
+    const diff = recentAvg - olderAvg;
+    const ratio = olderAvg > 0 ? recentAvg / olderAvg : (recentAvg > 0 ? 99 : 1);
+    if (diff >= 6 && ratio >= 1.45) return { label: '🔥 HEATING UP', tone: 'red', delta: diff, recent: recentAvg, older: olderAvg };
+    if (diff >= 3 && ratio >= 1.20) return { label: '⬆ MORE ACTIVE', tone: 'orange', delta: diff, recent: recentAvg, older: olderAvg };
+    if (diff <= -6 && ratio <= 0.60) return { label: '💤 DISAPPEARING', tone: 'grey', delta: diff, recent: recentAvg, older: olderAvg };
+    if (diff <= -3 && ratio <= 0.80) return { label: '⬇ DROPPING', tone: 'blue', delta: diff, recent: recentAvg, older: olderAvg };
+    return { label: '→ STABLE', tone: 'green', delta: diff, recent: recentAvg, older: olderAvg };
+  }
+
+  function buildAnalysisRows() {
+    const reports = state.reports.slice().sort((a, b) => (b.end || b.start) - (a.end || a.start));
+
+    state.rows = state.roster.map(r => {
+      let eligible = 0;
+      let active = 0;
+      let totalHits = 0;
+      let totalScore = 0;
+      let maxHits = 0;
+      const series = [];
+
+      for (const report of reports) {
+        const m = report.members.find(x => num(x.id) === num(r.id));
+        if (!m) {
+          series.push(null);
+          continue;
+        }
+        eligible++;
+        const attacks = num(m.attacks);
+        if (attacks > 0) active++;
+        totalHits += attacks;
+        totalScore += num(m.score);
+        maxHits = Math.max(maxHits, attacks);
+        series.push(attacks);
+      }
+
+      const participation = eligible ? (active / eligible) * 100 : 0;
+      const avg = eligible ? totalHits / eligible : 0;
+      const avgWhenActive = active ? totalHits / active : 0;
+
+      // Torn attacks cost 25 energy. Ranked-war reports expose recorded attacks,
+      // but do not reliably expose every possible energy-consuming action
+      // (e.g. failed offensive attempts / assists), and Revitalize can refund
+      // attack energy. These are therefore labelled EST. MINIMUM gross energy.
+      const totalEnergyMin = totalHits * 25;
+      const avgEnergyMin = avg * 25;
+      const avgEnergyActiveMin = avgWhenActive * 25;
+      const maxEnergyMin = maxHits * 25;
+
+      const recentKnown = series.filter(v => v !== null).slice(0, 3);
+      const recentAvg = recentKnown.length ? recentKnown.reduce((a,b)=>a+b,0)/recentKnown.length : 0;
+      const activityScore = Math.round(
+        Math.min(100, participation) * 0.55 +
+        Math.min(100, (avg / 25) * 100) * 0.30 +
+        Math.min(100, (recentAvg / 25) * 100) * 0.15
+      );
+      const cls = classifyActivity(eligible, active, avg, maxHits, participation, activityScore);
+      const trend = trendForSeries(series);
+      const newRecruit = r.days > 0 && r.days <= 30;
+
+      return {
+        ...r, eligible, active, participation, totalHits, totalScore, avg, avgWhenActive,
+        totalEnergyMin, avgEnergyMin, avgEnergyActiveMin, maxEnergyMin,
+        maxHits, activityScore, activityClass: cls.label, activityTone: cls.tone,
+        activityRank: cls.rank, series, recentAvg, trendLabel: trend.label,
+        trendTone: trend.tone, trendDelta: trend.delta, olderAvg: trend.older,
+        newRecruit,
+      };
+    });
+  }
+
+  function currentRosterWarSeries() {
+    const currentIds = new Set(state.roster.map(r => num(r.id)));
+    return state.reports.map(rep => {
+      const members = rep.members.filter(m => currentIds.has(num(m.id)));
+      return {
+        id: rep.id,
+        start: rep.start,
+        end: rep.end,
+        active: members.filter(m => num(m.attacks) > 0).length,
+        listed: members.length,
+        attacks: members.reduce((s,m)=>s+num(m.attacks),0),
+        score: members.reduce((s,m)=>s+num(m.score),0),
+        result: rep.result,
+      };
+    });
+  }
+
+  function factionMetrics() {
+    const rows = state.rows || [];
+    const wars = currentRosterWarSeries();
+    const rosterN = rows.length || 1;
+    const known = rows.filter(r=>r.eligible>0);
+    const unknown = rows.filter(r=>r.eligible===0);
+    const coreRows = rows.filter(r=>['WAR CORE','VERY ACTIVE'].includes(r.activityClass));
+    const regularRows = rows.filter(r=>r.activityClass==='ACTIVE');
+    const occasionalRows = rows.filter(r=>['OCCASIONAL','LIMITED DATA','1-WAR ACTIVE'].includes(r.activityClass));
+    const lowRows = rows.filter(r=>['LOW / 0-HIT','1-WAR LOW'].includes(r.activityClass));
+    const avg = arr => arr.length ? arr.reduce((a,b)=>a+b,0)/arr.length : 0;
+    const avgActive = avg(wars.map(w=>w.active));
+    const avgAttacks = avg(wars.map(w=>w.attacks));
+    const avgEnergyMin = avgAttacks * 25;
+    const avgDuration = avg(state.reports.filter(r=>r.end>r.start).map(r=>(r.end-r.start)/3600));
+    const winKnown = state.reports.filter(r=>['W','L'].includes(r.result));
+    const winPct = winKnown.length ? (winKnown.filter(r=>r.result==='W').length/winKnown.length)*100 : 0;
+
+    const byHits = rows.slice().sort((a,b)=>b.totalHits-a.totalHits);
+    const total = byHits.reduce((s,r)=>s+r.totalHits,0);
+    const share = n => total ? byHits.slice(0,n).reduce((s,r)=>s+r.totalHits,0)/total*100 : 0;
+    const top3 = share(3), top5 = share(5), top10 = share(10), top15 = share(15);
+
+    const actives = wars.map(w=>w.active);
+    const meanA = avg(actives);
+    const sdA = actives.length ? Math.sqrt(avg(actives.map(x=>(x-meanA)**2))) : 0;
+    const cv = meanA ? sdA/meanA : 0;
+
+    const recentWars = wars.slice(0,Math.min(3,wars.length));
+    const olderWars = wars.slice(3,10);
+    const recentAttacks = avg(recentWars.map(w=>w.attacks));
+    const olderAttacks = avg(olderWars.map(w=>w.attacks));
+    const recentActive = avg(recentWars.map(w=>w.active));
+    const olderActive = avg(olderWars.map(w=>w.active));
+
+    const styles=[];
+    if (top10 >= 65 || top5 >= 45) styles.push({label:'TOP-HEAVY',tone:'red',why:`Top 10 = ${Math.round(top10)}% of current-roster historical attacks.`});
+    if (avgActive/rosterN >= .55 && top10 < 58) styles.push({label:'DEEP ROSTER',tone:'green',why:`About ${avgActive.toFixed(1)} current members contribute per analyzed war.`});
+    if (top10 >= 50 && top10 < 70 && avgActive/rosterN >= .25) styles.push({label:'CORE + SUPPORT',tone:'orange',why:'A strong core produces most attacks, with a meaningful second group behind them.'});
+    if (rosterN >= 25 && avgActive/rosterN < .35) styles.push({label:'SMALL CORE / BIG BENCH',tone:'orange',why:`Only about ${Math.round(avgActive/rosterN*100)}% of the current roster historically attacks per war.`});
+    if (wars.length >= 5 && cv >= .30) styles.push({label:'INCONSISTENT LINEUP',tone:'blue',why:'The number of active current members changes a lot from war to war.'});
+    if (wars.length >= 5 && cv <= .15 && meanA>0) styles.push({label:'CONSISTENT LINEUP',tone:'green',why:'Their active-war headcount is fairly stable from war to war.'});
+    if (olderWars.length >= 2 && recentAttacks > olderAttacks*1.25 && recentAttacks-olderAttacks>=15) styles.push({label:'HEATING UP',tone:'red',why:'Recent current-roster attack volume is notably higher than older wars.'});
+    if (olderWars.length >= 2 && olderAttacks>0 && recentAttacks < olderAttacks*.75 && olderAttacks-recentAttacks>=15) styles.push({label:'DECLINING ACTIVITY',tone:'blue',why:'Recent current-roster attack volume is lower than their older baseline.'});
+    const newish = rows.filter(r=>r.newRecruit || r.eligible===0).length;
+    if (rows.length && newish/rows.length >= .18) styles.push({label:'NEW BLOOD / UNKNOWN',tone:'purple',why:`${newish} current members are new or lack usable history.`});
+    if (!styles.length) styles.push({label:'MIXED / BALANCED',tone:'yellow',why:'No single extreme war pattern dominates the data loaded so far.'});
+
+    const quality = state.reports.length >= 10 && known.length/rosterN >= .75 ? ['HIGH','green'] : state.reports.length >=5 && known.length/rosterN>=.5 ? ['MEDIUM','yellow'] : ['LOW','orange'];
+    return {wars, rosterN, known:known.length, unknown:unknown.length, coreRows, regularRows, occasionalRows, lowRows,
+      avgActive, avgAttacks, avgEnergyMin, avgDuration, winPct, top3, top5, top10, top15, styles, quality,
+      recentAttacks, olderAttacks, recentActive, olderActive, byHits};
+  }
+
+  async function analyzeHistory(force = false) {
+    if (!state.apiKey || !state.targetId || state.analyzing) return;
+    state.analyzing = true;
+    state.error = '';
+    state.warning = '';
+    render();
+
+    try {
+      state.progress = 'Discovering completed ranked wars…';
+      render();
+      state.availableWars = await discoverCompletedWars(state.warCatalogLimit);
+
+      const available = new Set(state.availableWars.map(w => String(w.id)));
+      let selected = (state.selectedWarIds.length ? state.selectedWarIds : loadSelectedWarIds(state.targetId))
+        .map(String).filter(id => available.has(id));
+      if (selected.join('|') !== state.selectedWarIds.join('|')) saveSelectedWarIds(state.targetId, selected);
+
+      if (!state.availableWars.length) {
+        state.reports = [];
+        buildAnalysisRows();
+        state.warning = 'No completed ranked wars were found for this faction.';
+        state.progress = 'No completed wars found';
+        return;
+      }
+      if (!selected.length) {
+        state.reports = [];
+        buildAnalysisRows();
+        state.warning = `Choose the exact wars you want to compare. ${state.availableWars.length} completed wars are available.`;
+        state.progress = 'Choose wars to compare';
+        return;
+      }
+
+      const chosen = new Set(selected);
+      const wars = state.availableWars.filter(w => chosen.has(String(w.id)));
+      const reports = [];
+      const errors = [];
+      for (let i = 0; i < wars.length; i++) {
+        state.progress = `Reading selected war ${i + 1} / ${wars.length}`;
+        render();
+        try {
+          let report = !force ? loadReportByWar(state.targetId, wars[i].id) : null;
+          if (!report) {
+            report = await fetchRankedWarReport(wars[i]);
+            if (report) saveReportByWar(state.targetId, wars[i].id, report);
+          }
+          if (report) reports.push(report);
+        } catch (e) { errors.push(e?.message || String(e)); }
+        await sleep(140);
+      }
+
+      state.reports = reports.sort((a,b)=>(b.end||b.start)-(a.end||a.start));
+      buildAnalysisRows();
+      state.warning = errors.length ? `${reports.length}/${wars.length} selected war reports loaded. ${errors.length} unavailable.` : '';
+      state.progress = `${reports.length} selected wars compared`;
+      state.lastScan = Date.now();
+    } finally {
+      state.analyzing = false;
+      render();
+    }
+  }
+
+  async function scanBase({ analyze = true, forceHistory = false } = {}) {
+    if (state.loading || !state.apiKey) return;
+    state.loading = true;
+    state.error = '';
+    render();
+
+    try {
+      const [me, own] = await Promise.all([
+        apiV1('/user/?selections=profile'),
+        apiV1('/faction/?selections=basic,rankedwars')
+      ]);
+
+      state.me = me;
+      state.ownFaction = own;
+      state.ownId = getFactionIdFromProfile(me) || num(own?.ID || own?.id || own?.faction_id);
+      if (!state.ownId) throw new Error('Could not detect your faction from this API key.');
+
+      const current = detectCurrentWar(own, state.ownId);
+      state.currentWar = current;
+
+      let nextTargetId = state.ownId;
+      let target = own;
+
+      if (state.scope === 'enemy') {
+        if (!current) throw new Error('No current or upcoming ranked-war opponent was found.');
+        nextTargetId = current.enemyId;
+        target = await apiV1(`/faction/${nextTargetId}?selections=basic,rankedwars`);
+      }
+
+      const targetChanged = num(state.targetId) !== num(nextTargetId);
+      state.targetId = nextTargetId;
+      state.target = target;
+      state.roster = rosterRows(target);
+      if (targetChanged) {
+        state.availableWars = [];
+        state.selectedWarIds = loadSelectedWarIds(state.targetId);
+      }
+      state.lastScan = Date.now();
+
+      if (targetChanged || !state.watch) loadWatch(state.targetId);
+      recordWatchSnapshot(true);
+
+      if (targetChanged) {
+        state.reports = [];
+        state.rows = [];
+      } else if (state.reports.length) {
+        buildAnalysisRows();
+      } else {
+        state.rows = state.roster.map(r => ({
+          ...r, eligible:0, active:0, participation:0, totalHits:0, totalScore:0,
+          avg:0, avgWhenActive:0, totalEnergyMin:0, avgEnergyMin:0,
+          avgEnergyActiveMin:0, maxEnergyMin:0, maxHits:0, activityScore:0,
+          activityClass:'WAITING', activityTone:'grey', activityRank:0, series:[],
+          recentAvg:0, trendLabel:'LIMITED', trendTone:'grey', trendDelta:0,
+          olderAvg:0, newRecruit:r.days > 0 && r.days <= 30
+        }));
+      }
+    } catch (e) {
+      state.error = e?.message || String(e);
+    } finally {
+      state.loading = false;
+      render();
+    }
+
+    if (!state.error && analyze) await analyzeHistory(forceHistory);
+  }
+
+  function watchKey(targetId) { return `prewarWatch:${targetId}`; }
+
+  function loadWatch(targetId) {
+    const w = storageGet(watchKey(targetId), null);
+    state.watch = w && typeof w === 'object' ? w : { started: Date.now(), lastSample: 0, samples: 0, players: {} };
+  }
+
+  function saveWatch() {
+    if (state.targetId && state.watch) storageSet(watchKey(state.targetId), state.watch);
+  }
+
+  function tctBucket(tsMs=Date.now()) {
+    const h = new Date(tsMs).getUTCHours();
+    return Math.floor(h/4); // Torn City Time is UTC.
+  }
+
+  function bucketLabel(i) {
+    const start=i*4, end=(i*4+4)%24;
+    return `${String(start).padStart(2,'0')}:00–${String(end).padStart(2,'0')}:00 TCT`;
+  }
+
+  function recordWatchSnapshot(force=false) {
+    if (!state.targetId || !state.roster.length) return;
+    if (!state.watch) loadWatch(state.targetId);
+    const now=Date.now();
+    if (!force && now-num(state.watch.lastSample) < WATCH_REFRESH_MS-15000) return;
+    state.watch.lastSample=now;
+    state.watch.samples=num(state.watch.samples)+1;
+    const b=tctBucket(now);
+    for (const r of state.roster) {
+      const id=String(r.id);
+      const p=state.watch.players[id] || {name:r.name,first:now,last:now,total:0,active20:0,online2:0,buckets:{}};
+      p.name=r.name; p.last=now; p.total=num(p.total)+1;
+      if (r.lastAge<=20*60) p.active20=num(p.active20)+1;
+      if (r.lastAge<=120) p.online2=num(p.online2)+1;
+      const bb=p.buckets[b] || {total:0,active20:0,online2:0};
+      bb.total=num(bb.total)+1;
+      if (r.lastAge<=20*60) bb.active20=num(bb.active20)+1;
+      if (r.lastAge<=120) bb.online2=num(bb.online2)+1;
+      p.buckets[b]=bb;
+      state.watch.players[id]=p;
+    }
+    saveWatch();
+  }
+
+  function watchFor(id) {
+    const p=state.watch?.players?.[String(id)];
+    if (!p) return {total:0,activePct:0,onlinePct:0,best:[],hours:[]};
+    const hours=[];
+    for(let i=0;i<6;i++){
+      const b=p.buckets?.[i] || {total:0,active20:0,online2:0};
+      hours.push({i,label:bucketLabel(i),total:num(b.total),activePct:b.total?num(b.active20)/b.total*100:0,onlinePct:b.total?num(b.online2)/b.total*100:0});
+    }
+    const best=hours.filter(x=>x.total>=2).slice().sort((a,b)=>b.activePct-a.activePct).slice(0,2);
+    return {total:num(p.total),activePct:p.total?num(p.active20)/p.total*100:0,onlinePct:p.total?num(p.online2)/p.total*100:0,best,hours,first:p.first,last:p.last};
+  }
+
+  function threatFor(r) {
+    const w=watchFor(r.id);
+    let score=r.activityScore;
+    if (w.total>=3) score=Math.round(score*.75+w.activePct*.25);
+    if (r.newRecruit && r.eligible===0) return {label:'UNKNOWN — WATCH',tone:'purple',score};
+    if (score>=80) return {label:'VERY HIGH',tone:'red',score};
+    if (score>=65) return {label:'HIGH',tone:'orange',score};
+    if (score>=45) return {label:'MEDIUM',tone:'yellow',score};
+    if (r.eligible===0) return {label:'UNKNOWN',tone:'purple',score};
+    return {label:'LOW',tone:'grey',score};
+  }
+
+  function filteredRows() {
+    const q = state.filter.trim().toLowerCase();
+    let rows = state.rows.filter(r => {
+      if (!q) return true;
+      return `${r.name} ${r.id} ${r.position} ${r.activityClass} ${r.trendLabel} ${r.state} ${r.live}`.toLowerCase().includes(q);
+    });
+
+    const sorters = {
+      activityScore: (a,b) => b.activityScore-a.activityScore || b.avg-a.avg || b.participation-a.participation,
+      participation: (a,b) => b.participation-a.participation || b.avg-a.avg,
+      avg: (a,b) => b.avg-a.avg || b.participation-a.participation,
+      totalHits: (a,b) => b.totalHits-a.totalHits,
+      maxHits: (a,b) => b.maxHits-a.maxHits,
+      recent: (a,b) => (num(b.series?.[0], -1)-num(a.series?.[0], -1)) || b.activityScore-a.activityScore,
+      live: (a,b) => a.lastAge-b.lastAge,
+      level: (a,b) => b.level-a.level,
+      name: (a,b) => a.name.localeCompare(b.name),
+    };
+    rows.sort(sorters[state.sort] || sorters.activityScore);
+    return rows;
+  }
+
+  function seriesHtml(r, limit = 5) {
+    const vals = (r.series || []).slice(0, limit);
+    if (!vals.length) return '<span class="pwi-muted">No report data</span>';
+    return vals.map((v, i) => {
+      if (v === null) return `<span class="pwi-hit pwi-na" title="Not listed in this war">—</span>`;
+      const cls = v >= 20 ? 'pwi-hot' : v >= 8 ? 'pwi-warm' : v > 0 ? 'pwi-cool' : 'pwi-zero';
+      return `<span class="pwi-hit ${cls}" title="War ${i+1}: ${v} attacks">${v}</span>`;
+    }).join('');
+  }
+
+  function summary() {
+    const m=factionMetrics();
+    const top=m.byHits[0];
+    return {core:m.coreRows.length,very:0,active:m.regularRows.length,low:m.lowRows.length+m.unknown,
+      known:m.known,avgParticipants:m.avgActive,top};
+  }
+
+  function injectCss() {
+    if (document.getElementById(`${UI}-css-v350`)) return;
+    document.querySelectorAll(`style[id^="${UI}-css"]`).forEach(x => x.remove());
+    const s = document.createElement('style');
+    s.id = `${UI}-css-v350`;
+    s.textContent = `
+#${UI}-btn{
+display:inline-flex!important;align-items:center!important;justify-content:center!important;
+width:23px!important;height:23px!important;min-width:23px!important;max-width:23px!important;
+margin:0 2px!important;padding:0!important;border:0!important;border-radius:4px!important;
+background:transparent!important;color:inherit!important;font-size:16px!important;line-height:1!important;
+font-weight:400!important;box-shadow:none!important;cursor:pointer!important;user-select:none!important;
+position:relative!important;left:auto!important;right:auto!important;top:auto!important;bottom:auto!important;
+z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
+-webkit-appearance:none!important;appearance:none!important;transform:none!important
+}
+#${UI}-btn:hover{opacity:.95!important;filter:drop-shadow(0 1px 2px rgba(0,0,0,.75))}
+#${UI}-btn.pwi-header-hidden{display:none!important}
+#${UI}-panel{position:fixed;inset:0;z-index:999999;background:#0c110e;color:#edf5ef;font:13px/1.35 Arial,sans-serif;display:flex;flex-direction:column;overflow:hidden;overscroll-behavior:contain}
+#${UI}-panel *{box-sizing:border-box}
+.pwi-head{flex:0 0 auto;background:#131d16;border-bottom:1px solid #34443a;padding:7px 8px;display:flex;align-items:center;gap:6px}
+.pwi-titlewrap{min-width:0;flex:1}.pwi-title{font-size:15px;font-weight:900;color:#81ff95;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pwi-sub{font-size:9px;color:#93aa9a;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pwi-btn{border:1px solid #465c4d;background:#1a261e;color:#f1f7f3;border-radius:8px;padding:7px 8px;font-weight:800;font-size:10px;cursor:pointer;white-space:nowrap}.pwi-btn:active{background:#26362b}.pwi-btn[disabled]{opacity:.55}
+.pwi-error,.pwi-warn{margin:6px 7px 0;border-radius:8px;padding:7px 8px;font-size:10px;flex:0 0 auto}.pwi-error{background:#371b1b;border:1px solid #7a3939;color:#ffb3b3}.pwi-warn{background:#382f16;border:1px solid #75602b;color:#ffe5a0}
+.pwi-summary{display:flex;gap:5px;overflow-x:auto;overflow-y:hidden;padding:6px 7px;scrollbar-width:none;flex:0 0 auto;background:#0f1511}.pwi-summary::-webkit-scrollbar{display:none}.pwi-scard{flex:0 0 96px;background:#161e18;border:1px solid #2c3c32;border-radius:8px;padding:5px 6px}.pwi-scard.wide{flex-basis:170px}.pwi-scard span{display:block;color:#8fa596;font-size:8px;text-transform:uppercase}.pwi-scard b{display:block;font-size:12px;color:#fff;line-height:1.25;margin-top:2px}
+.pwi-toolbar{flex:0 0 auto;padding:5px 7px;border-top:1px solid #1e2a22;border-bottom:1px solid #2c3930;display:grid;grid-template-columns:1fr auto;gap:5px;background:#111712}.pwi-toolbar input,.pwi-toolbar select{min-width:0;width:100%;background:#090d0a;color:#fff;border:1px solid #415247;border-radius:7px;padding:7px;font-size:11px}.pwi-toolbar2{display:flex;gap:5px;grid-column:1/-1;overflow-x:auto;scrollbar-width:none}.pwi-toolbar2::-webkit-scrollbar{display:none}
+.pwi-body{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;touch-action:pan-y;padding:6px 7px calc(30px + env(safe-area-inset-bottom,0px));overscroll-behavior:contain}
+.pwi-card{background:#151d18;border:1px solid #2b3930;border-radius:10px;margin:0 0 6px;padding:8px}.pwi-top{display:flex;gap:6px;align-items:flex-start}.pwi-who{flex:1;min-width:0}.pwi-name{font-size:13px;font-weight:900;color:#fff;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pwi-meta{font-size:9px;color:#97aa9d;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.pwi-score{flex:0 0 auto;text-align:right}.pwi-score b{font-size:19px;line-height:1;color:#fff}.pwi-score span{display:block;font-size:8px;color:#90a496}
+.pwi-row{display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:7px}.pwi-stat{background:#101611;border:1px solid #243129;border-radius:7px;padding:4px 5px}.pwi-stat span{display:block;color:#819388;font-size:7px;text-transform:uppercase}.pwi-stat b{font-size:11px;color:#fff}
+.pwi-bottom{display:flex;gap:5px;align-items:center;flex-wrap:wrap;margin-top:7px}.pwi-pill{display:inline-block;border:1px solid #ffffff20;border-radius:99px;padding:3px 6px;font-size:9px;font-weight:900}.tone-green{background:#173d22;color:#8aff9c}.tone-yellow{background:#443d12;color:#ffe870}.tone-orange{background:#4a2e13;color:#ffbd73}.tone-red{background:#48181a;color:#ff7c80}.tone-grey{background:#292d2a;color:#bcc1bd}.tone-blue{background:#18334d;color:#90caff}.tone-purple{background:#351c49;color:#dda1ff}
+.pwi-series{display:flex;gap:3px;align-items:center}.pwi-hit{display:inline-flex;align-items:center;justify-content:center;min-width:25px;height:22px;border-radius:5px;border:1px solid #ffffff16;font-size:9px;font-weight:900}.pwi-hot{background:#4a191b;color:#ff8a8e}.pwi-warm{background:#493315;color:#ffd07a}.pwi-cool{background:#18364d;color:#8dccff}.pwi-zero{background:#252b27;color:#929c95}.pwi-na{background:#131714;color:#5f6962}.pwi-muted{color:#7f8d83;font-size:9px}
+.pwi-detail{margin-left:auto}.pwi-footnote{font-size:9px;color:#74867a;margin:3px 2px 10px}
+.pwi-shade{position:fixed;inset:0;z-index:1000001;background:#000c;display:flex;align-items:flex-start;justify-content:center;padding:max(8px,env(safe-area-inset-top,0px)) 7px max(8px,env(safe-area-inset-bottom,0px))}
+.pwi-modal{width:min(560px,100%);max-height:calc(100dvh - 16px);overflow:auto;-webkit-overflow-scrolling:touch;background:#131b16;border:1px solid #46574b;border-radius:11px;padding:11px;color:#fff}.pwi-modal h3{margin:0 0 8px;color:#82ff95}.pwi-modal table{width:100%;border-collapse:collapse;font-size:10px}.pwi-modal th,.pwi-modal td{padding:6px 4px;border-bottom:1px solid #29352d;text-align:left}.pwi-modal th{color:#93a89a}.pwi-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}
+.pwi-warselect-modal{display:flex;flex-direction:column;width:min(560px,100%);height:min(92dvh,820px);max-height:calc(100dvh - 12px);overflow:hidden;padding:0}
+.pwi-warselect-head{flex:0 0 auto;display:flex;align-items:flex-start;gap:8px;padding:11px 11px 8px;border-bottom:1px solid #2f4035;background:#131b16}
+.pwi-warselect-headtxt{flex:1;min-width:0}.pwi-warselect-head h3{margin:0;color:#82ff95}.pwi-warselect-close{flex:0 0 auto;min-width:34px;height:34px;padding:0;font-size:16px}
+.pwi-warselect-tools{flex:0 0 auto;padding:7px 11px;border-bottom:1px solid #26352c;background:#101611}
+.pwi-warselect-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:8px 11px 12px;touch-action:pan-y}
+.pwi-warselect-footer{flex:0 0 auto;display:flex;gap:7px;justify-content:flex-end;padding:9px 11px calc(9px + env(safe-area-inset-bottom,0px));border-top:1px solid #3a4b40;background:#131b16;box-shadow:0 -6px 14px #0008}
+.pwi-warselect-footer .pwi-btn{min-height:38px}.pwi-warselect-footer [data-ws="apply"]{background:#24452d;border-color:#64a674;color:#9dffad}
+
+.pwi-warselect-list{display:flex;flex-direction:column;gap:5px;margin-top:8px}
+.pwi-warchoice{display:flex;align-items:flex-start;gap:8px;background:#101611;border:1px solid #29372e;border-radius:8px;padding:7px;cursor:pointer}
+.pwi-warchoice input{margin-top:2px;flex:0 0 auto;accent-color:#78ef8d}
+.pwi-warchoice-main{flex:1;min-width:0}.pwi-warchoice-main b{display:block;font-size:10px;color:#fff}.pwi-warchoice-main span{display:block;font-size:9px;color:#91a397;margin-top:2px}
+.pwi-warselect-summary{font-size:10px;color:#b9c7bd;margin:5px 0}
+
+.pwi-keybox{padding:14px}.pwi-keybox input{width:100%;background:#090d0a;color:#fff;border:1px solid #44584a;border-radius:8px;padding:10px;margin:9px 0}.pwi-keynote{font-size:10px;color:#93a399;line-height:1.45}
+
+.pwi-scope{display:flex;gap:5px;padding:5px 7px;background:#0d130f;border-bottom:1px solid #26342b;flex:0 0 auto}.pwi-scopebtn{flex:1;border:1px solid #34473b;background:#141c17;color:#99aa9e;border-radius:8px;padding:8px 6px;font-size:10px;font-weight:900;cursor:pointer}.pwi-scopebtn.active{background:#213529;color:#82ff95;border-color:#5f8d6c}
+.pwi-tabs{display:flex;gap:5px;padding:5px 7px;background:#101611;border-bottom:1px solid #2c3930;flex:0 0 auto}
+.pwi-tab{flex:1;border:1px solid #34473b;background:#151d18;color:#9cad9f;border-radius:7px;padding:7px 6px;font-size:10px;font-weight:900;cursor:pointer}
+.pwi-tab.active{background:#203126;color:#82ff95;border-color:#557561}
+.pwi-help{padding-bottom:20px}
+.pwi-helpbox{background:#151d18;border:1px solid #2b3930;border-radius:10px;margin:0 0 7px;padding:9px}
+.pwi-helpbox h3{font-size:12px;color:#82ff95;margin:0 0 6px}
+.pwi-helpbox p{font-size:10px;color:#c8d2cb;margin:4px 0;line-height:1.45}
+.pwi-helpgrid{display:grid;grid-template-columns:1fr;gap:5px}
+.pwi-helpitem{background:#101611;border:1px solid #253229;border-radius:7px;padding:7px}
+.pwi-helpitem b{display:block;color:#fff;font-size:10px;margin-bottom:2px}
+.pwi-helpitem span{display:block;color:#91a397;font-size:9px;line-height:1.4}
+.pwi-example{font-family:monospace;background:#090d0a;border:1px solid #26332a;border-radius:7px;padding:7px;color:#eef5ef;font-size:10px;white-space:pre-wrap}
+
+.pwi-tabs{overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.pwi-tabs::-webkit-scrollbar{display:none}.pwi-tab{flex:0 0 auto;min-width:105px}
+.pwi-section{background:#151d18;border:1px solid #2b3930;border-radius:10px;padding:9px;margin:0 0 7px}.pwi-section h3{margin:0 0 6px;color:#82ff95;font-size:12px}.pwi-section p{font-size:10px;color:#c5d0c8;margin:4px 0;line-height:1.45}
+.pwi-kpis{display:grid;grid-template-columns:repeat(2,1fr);gap:5px}.pwi-kpi{background:#0f1511;border:1px solid #27352c;border-radius:8px;padding:7px}.pwi-kpi span{display:block;color:#85978b;font-size:8px;text-transform:uppercase}.pwi-kpi b{display:block;color:#fff;font-size:15px;margin-top:2px}
+.pwi-style{display:flex;gap:5px;align-items:flex-start;background:#101611;border:1px solid #26342b;border-radius:8px;padding:7px;margin-top:5px}.pwi-style .pwi-pill{flex:0 0 auto}.pwi-style span:last-child{font-size:9px;color:#aebcb2;line-height:1.4}
+.pwi-conc{margin-top:7px}.pwi-barline{display:grid;grid-template-columns:48px 1fr 38px;gap:6px;align-items:center;margin:5px 0;font-size:9px}.pwi-track{height:8px;background:#0a0e0b;border:1px solid #26332a;border-radius:99px;overflow:hidden}.pwi-fill{height:100%;background:linear-gradient(90deg,#6cff85,#ffcb62)}
+.pwi-teamhead{display:flex;align-items:center;justify-content:space-between;gap:7px;margin-bottom:5px}.pwi-teamhead b{font-size:12px;color:#fff}.pwi-teamhead span{font-size:9px;color:#90a095}
+.pwi-mini{background:#101611;border:1px solid #27342c;border-radius:8px;padding:7px;margin-bottom:5px}.pwi-mini-top{display:flex;gap:6px;align-items:center}.pwi-mini-name{flex:1;min-width:0;font-weight:900;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.pwi-mini-meta{font-size:8px;color:#8fa095;margin-top:3px}.pwi-mini .pwi-series{margin-top:5px}
+.pwi-watchgrid{display:grid;grid-template-columns:1fr;gap:5px}.pwi-hour{background:#101611;border:1px solid #27342c;border-radius:8px;padding:7px}.pwi-hour-top{display:flex;justify-content:space-between;font-size:9px}.pwi-hourbar{height:7px;background:#090d0a;border-radius:9px;overflow:hidden;margin-top:5px}.pwi-hourfill{height:100%;background:#72dd86}
+.pwi-note{font-size:9px;color:#88988d;background:#111712;border:1px solid #253129;border-radius:7px;padding:7px;margin:5px 0}
+.pwi-badge-row{display:flex;gap:5px;flex-wrap:wrap;margin-top:5px}
+
+`;
+    document.head.appendChild(s);
+  }
+
+  let lockedHeaderParent = null;
+  let lockedHeaderAnchor = null;
+
+  function makeLauncherButton() {
+    let b = document.getElementById(`${UI}-btn`);
+    if (!b) {
+      b = document.createElement('button');
+      b.id = `${UI}-btn`;
+      b.type = 'button';
+      b.textContent = '🕵️';
+      b.title = 'WRATH War Intelligence';
+      b.setAttribute('aria-label', 'Open WRATH War Intelligence');
+      b.addEventListener('click', () => {
+        state.open = !state.open;
+        render();
+        if (state.open && state.apiKey) scanBase({ analyze: true, forceHistory: false });
+      });
+    }
+    return b;
+  }
+
+  function headerCandidateText(el) {
+    if (!el) return '';
+    return [
+      el.textContent || '',
+      el.className || '',
+      el.id || '',
+      el.getAttribute?.('title') || '',
+      el.getAttribute?.('aria-label') || '',
+      el.getAttribute?.('alt') || '',
+      String(el.innerHTML || '').slice(0, 180)
+    ].join(' ').toLowerCase();
+  }
+
+  function findTornHeaderGenderTarget() {
+    const nodes = Array.from(document.querySelectorAll('a,button,div,span,li,i,img,svg'));
+    const candidates = [];
+
+    for (const el of nodes) {
+      if (!el || el.id === `${UI}-btn` || el.closest?.(`#${UI}-panel`)) continue;
+
+      const r = el.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+
+      // Keep this search in Torn's upper header/resource area.
+      if (r.top < -5 || r.top > 340) continue;
+      if (r.left < window.innerWidth * 0.20) continue;
+
+      const hay = headerCandidateText(el);
+      const textOnly = String(el.textContent || '').trim();
+
+      const genderHit =
+        textOnly.includes('♂') ||
+        textOnly.includes('♀') ||
+        hay.includes('gender') ||
+        hay.includes('male') ||
+        hay.includes('female') ||
+        hay.includes('&male') ||
+        hay.includes('&female');
+
+      if (!genderHit) continue;
+
+      let score = 0;
+      if (textOnly.includes('♂') || textOnly.includes('♀')) score += 140;
+      if (hay.includes('gender')) score += 100;
+      if (r.width >= 12 && r.width <= 50) score += 35;
+      if (r.height >= 12 && r.height <= 50) score += 35;
+      if (r.left > window.innerWidth * 0.45) score += 25;
+      score -= Math.abs(r.width - 24) * 0.4;
+      score -= Math.abs(r.height - 24) * 0.4;
+
+      candidates.push({ el, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0]?.el || null;
+  }
+
+  function findTornHeaderResourceRow() {
+    // Fallback for header versions where the gender element has no useful label.
+    // Prefer compact flex-like rows in the top-right containing Torn resource items.
+    const rows = Array.from(document.querySelectorAll(
+      'header, [class*="header"], [id*="header"], [class*="resource"], [class*="status"]'
+    ));
+    const candidates = [];
+
+    for (const root of rows) {
+      const r = root.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      if (r.top < -5 || r.top > 340) continue;
+
+      const children = Array.from(root.children || []);
+      if (children.length < 2) continue;
+
+      const hay = headerCandidateText(root);
+      let score = 0;
+      if (hay.includes('point')) score += 50;
+      if (hay.includes('merit')) score += 45;
+      if (hay.includes('money') || hay.includes('cash')) score += 30;
+      if (hay.includes('gender') || hay.includes('male') || hay.includes('female')) score += 60;
+      if (r.left > window.innerWidth * 0.25) score += 20;
+      if (r.height <= 80) score += 20;
+
+      if (score > 0) candidates.push({ el: root, score });
+    }
+
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0]?.el || null;
+  }
+
+  function mountLauncherInTornHeader() {
+    const b = makeLauncherButton();
+
+    // If Torn has not destroyed the header we originally mounted into, do nothing.
+    // This is the key anti-jump rule: never rescan/reposition a live icon.
+    if (b.isConnected && !b.classList.contains('pwi-header-hidden') &&
+        lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) {
+      return true;
+    }
+
+    // The old Torn header was actually replaced; only now are we allowed to find a new slot.
+    lockedHeaderParent = null;
+    lockedHeaderAnchor = null;
+
+    const gender = findTornHeaderGenderTarget();
+    if (gender?.parentElement) {
+      lockedHeaderAnchor = gender;
+      lockedHeaderParent = gender.parentElement;
+      gender.insertAdjacentElement('afterend', b);
+      b.classList.remove('pwi-header-hidden');
+      return true;
+    }
+
+    const row = findTornHeaderResourceRow();
+    if (row) {
+      lockedHeaderParent = row;
+      row.appendChild(b);
+      b.classList.remove('pwi-header-hidden');
+      return true;
+    }
+
+    if (!b.isConnected) document.body.appendChild(b);
+    b.classList.add('pwi-header-hidden');
+    return false;
+  }
+
+  function ensureUi() {
+    injectCss();
+    mountLauncherInTornHeader();
+  }
+
+  function phaseLabel() {
+    const now = nowSec();
+    if (state.scope === 'own') {
+      if (!state.currentWar) return 'MY FACTION';
+      if (state.currentWar.start > now) return 'MY FACTION • UPCOMING WAR';
+      if (!state.currentWar.end || state.currentWar.end > now) return 'MY FACTION • LIVE WAR';
+      return 'MY FACTION';
+    }
+    if (!state.currentWar) return 'ENEMY • NO WAR';
+    if (state.currentWar.start > now) return 'ENEMY • UPCOMING';
+    if (!state.currentWar.end || state.currentWar.end > now) return 'ENEMY • LIVE';
+    return 'ENEMY';
+  }
+
+  function keyScreen() {
+    return `<div id="${UI}-panel">
+      <div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">HISTORICAL RANKED-WAR ACTIVITY</div></div><button class="pwi-btn" data-act="close">✕</button></div>
+      <div class="pwi-keybox">
+        <h3 style="color:#82ff95;margin:0 0 6px">Torn API Key</h3>
+        <div class="pwi-keynote">This script uses your key only to read Torn API data needed for your current/upcoming opponent and completed ranked-war reports. The key and cached analysis stay on this device and are not sent to any outside server.</div>
+        <input id="pwi-key" type="password" placeholder="Paste Torn API key">
+        <button class="pwi-btn" data-act="savekey">SAVE KEY & ANALYZE WAR</button>
+      </div>
+    </div>`;
+  }
+
+
+  function helpHtml() {
+    return `<div class="pwi-help">
+      <div class="pwi-helpbox"><h3>☣ WHAT v3 IS FOR</h3><p>This profiles <b>your faction or your current ranked-war enemy</b> using the same measurements, so you can judge your own war readiness and compare it with the opposition.</p></div>
+      <div class="pwi-helpbox"><h3>THE FIVE TABS</h3><div class="pwi-helpgrid">
+        <div class="pwi-helpitem"><b>WAR PROFILE</b><span>Faction-level answer: how many serious hitters the selected faction normally uses, whether it is top-heavy, deep, inconsistent, heating up, and how concentrated its attack production is.</span></div>
+        <div class="pwi-helpitem"><b>WAR TEAM</b><span>Current members grouped into Core, Regular, Occasional, Low, and Unknown/New.</span></div>
+        <div class="pwi-helpitem"><b>MEMBERS</b><span>Individual historical participation, average hits, recent trend, and last five analyzed wars.</span></div>
+        <div class="pwi-helpitem"><b>PRE-WAR WATCH</b><span>Local observations made while Torn/TornPDA is running. It estimates when the selected faction’s current members tend to be active in Torn City Time. This is not proof of war-hit timing.</span></div>
+        <div class="pwi-helpitem"><b>HOW TO READ</b><span>This explanation screen.</span></div>
+      </div></div>
+      <div class="pwi-helpbox"><h3>IMPORTANT NUMBERS</h3><div class="pwi-helpgrid">
+        <div class="pwi-helpitem"><b>WAR PARTICIPATION</b><span>Percent of analyzed wars in which that player made at least one attack, among reports where they were listed.</span></div>
+        <div class="pwi-helpitem"><b>AVG HITS/WAR</b><span>Average attacks across wars where they were listed, including zero-hit appearances.</span></div>
+        <div class="pwi-helpitem"><b>EST. MIN ENERGY/WAR</b><span>Average recorded ranked-war attacks × 25 energy. This is a minimum/gross estimate, not exact net energy. Failed offensive attempts or assists may not be represented by the report, while Revitalize can restore attack energy.</span></div>
+        <div class="pwi-helpitem"><b>ACTIVITY SCORE</b><span>Our 0–100 comparison score combining participation, attack volume, and recent activity. It is not a Torn battle stat.</span></div>
+        <div class="pwi-helpitem"><b>RECENT FORM</b><span>Compares roughly the newest three known wars with older known wars. Heating Up means recent attack volume has materially increased.</span></div>
+      </div></div>
+      <div class="pwi-helpbox"><h3>LAST FIVE WAR BOXES</h3><div class="pwi-example">31 | 24 | 0 | — | 35</div><p><b>0</b> means the player was listed but made zero attacks. <b>—</b> means the player was not listed in that report.</p></div>
+      <div class="pwi-helpbox"><h3>DATA QUALITY</h3><p><b>HIGH</b> means many completed reports were loaded and most current members have usable history. <b>LOW</b> means conclusions should be treated cautiously. A member with NO HISTORY is <b>unknown, not weak</b>.</p></div>
+      <div class="pwi-helpbox"><h3>PRE-WAR WATCH LIMIT</h3><p>The userscript can only observe while Torn is actually allowed to run it. TornPDA/Android may suspend the page in the background, so gaps are normal. The watch tab shows observation counts so you can judge confidence.</p></div>
+    </div>`;
+  }
+
+  function profileHtml() {
+    const m=factionMetrics();
+    if (!state.reports.length) return `<div class="pwi-section"><h3>WAR PROFILE</h3><p>${state.analyzing ? esc(state.progress) : 'No completed war reports loaded yet. Tap RESCAN HISTORY.'}</p></div>`;
+    const top=m.byHits[0];
+    return `<div class="pwi-section"><h3>☣ ${state.scope==='own'?'MY FACTION WAR PROFILE':'ENEMY WAR PROFILE'}</h3><div class="pwi-note"><b>Comparison set:</b> ${state.reports.length} selected war${state.reports.length===1?'':'s'} loaded.</div>
+      <div class="pwi-badge-row"><span class="pwi-pill tone-${m.quality[1]}">DATA ${m.quality[0]}</span><span class="pwi-pill tone-blue">${state.reports.length} WARS READ</span><span class="pwi-pill tone-purple">${m.unknown} UNKNOWN CURRENT MEMBERS</span></div>
+      <div class="pwi-kpis" style="margin-top:7px">
+        <div class="pwi-kpi"><span>LIKELY CORE</span><b>${m.coreRows.length}</b></div>
+        <div class="pwi-kpi"><span>REGULAR HITTERS</span><b>${m.regularRows.length}</b></div>
+        <div class="pwi-kpi"><span>AVG ACTIVE / WAR</span><b>${fmtNum(m.avgActive,1)}</b></div>
+        <div class="pwi-kpi"><span>AVG ATTACKS / WAR</span><b>${fmtNum(m.avgAttacks,0)}</b></div>
+        <div class="pwi-kpi"><span>EST. MIN ENERGY / WAR</span><b>${m.avgAttacks ? `${fmtNum(m.avgAttacks * 25,0)}E` : '—'}</b></div>
+        <div class="pwi-kpi"><span>AVG WAR LENGTH</span><b>${m.avgDuration ? `${fmtNum(m.avgDuration,1)}h` : '—'}</b></div>
+        <div class="pwi-kpi"><span>WINS IN DATA</span><b>${state.reports.filter(r=>['W','L'].includes(r.result)).length ? `${Math.round(m.winPct)}%` : '—'}</b></div>
+      </div>
+    </div>
+    <div class="pwi-section"><h3>${state.scope==='own'?'HOW WE APPEAR TO WAR':'HOW THEY APPEAR TO WAR'}</h3>${m.styles.map(s=>`<div class="pwi-style"><span class="pwi-pill tone-${s.tone}">${esc(s.label)}</span><span>${esc(s.why)}</span></div>`).join('')}</div>
+    <div class="pwi-section"><h3>ATTACK CONCENTRATION — CURRENT ROSTER HISTORY</h3><p>How much of the loaded current-member attack production comes from the selected faction’s top hitters.</p>
+      <div class="pwi-conc">${[[3,m.top3],[5,m.top5],[10,m.top10],[15,m.top15]].map(([n,v])=>`<div class="pwi-barline"><b>Top ${n}</b><div class="pwi-track"><div class="pwi-fill" style="width:${Math.min(100,v)}%"></div></div><b>${Math.round(v)}%</b></div>`).join('')}</div>
+      ${top ? `<div class="pwi-note">Top historical current-roster contributor: <b>${esc(top.name)}</b> — ${top.totalHits} attacks across the loaded reports.</div>`:''}
+      <div class="pwi-note"><b>Estimated minimum energy:</b> recorded attacks × 25E. It is intentionally labelled minimum because the public ranked-war report does not prove every failed attack/assist expenditure, and Revitalize can refund attack energy.</div>
+    </div>
+    <div class="pwi-section"><h3>RECENT FACTION FORM</h3>
+      <div class="pwi-kpis"><div class="pwi-kpi"><span>LAST 3 AVG ATTACKS</span><b>${fmtNum(m.recentAttacks,0)}</b></div><div class="pwi-kpi"><span>OLDER AVG ATTACKS</span><b>${m.olderAttacks?fmtNum(m.olderAttacks,0):'—'}</b></div><div class="pwi-kpi"><span>LAST 3 ACTIVE MEMBERS</span><b>${fmtNum(m.recentActive,1)}</b></div><div class="pwi-kpi"><span>OLDER ACTIVE MEMBERS</span><b>${m.olderActive?fmtNum(m.olderActive,1):'—'}</b></div></div>
+      <div class="pwi-note">These figures only count players who are in the selected faction <b>now</b>. Older wars can undercount if much of today's roster joined later.</div>
+    </div>`;
+  }
+
+  function miniMember(r) {
+    const t=threatFor(r);
+    return `<div class="pwi-mini"><div class="pwi-mini-top"><div class="pwi-mini-name">${esc(r.name)} [${r.id}]</div><span class="pwi-pill tone-${t.tone}">${esc(t.label)}</span><button class="pwi-btn" data-detail="${r.id}">DETAILS</button></div><div class="pwi-mini-meta">${r.active}/${r.eligible || 0} active wars • ${r.eligible?Math.round(r.participation):0}% participation • ${r.eligible?fmtNum(r.avg,1):'—'} avg hits • ${r.eligible?`${fmtNum(r.avgEnergyMin,0)}E est. min/war`:'— energy'} • ${esc(r.trendLabel)} ${r.newRecruit?'• NEW ≤30D':''}</div><div class="pwi-series">${seriesHtml(r,5)}</div></div>`;
+  }
+
+  function teamGroup(title, rows, tone, desc) {
+    const sorted=rows.slice().sort((a,b)=>b.activityScore-a.activityScore);
+    return `<div class="pwi-section"><div class="pwi-teamhead"><div><b>${esc(title)}</b><span style="display:block">${esc(desc)}</span></div><span class="pwi-pill tone-${tone}">${sorted.length}</span></div>${sorted.map(miniMember).join('') || '<div class="pwi-muted">None in this group.</div>'}</div>`;
+  }
+
+  function teamHtml() {
+    const m=factionMetrics();
+    const unknown=state.rows.filter(r=>r.eligible===0);
+    return `${teamGroup('🔴 CORE WAR TEAM',m.coreRows,'red','Most reliable / highest-volume current members.')}${teamGroup('🟠 REGULAR HITTERS',m.regularRows,'orange','Often contributes and should be expected to appear.')}${teamGroup('🟡 OCCASIONAL',m.occasionalRows,'yellow','Shows up in some wars but less consistently.')}${teamGroup('⚪ LOW HISTORICAL ACTIVITY',m.lowRows,'grey','Historically low or zero attack output.')}${teamGroup('🟣 UNKNOWN / NEW',unknown,'purple','Do not treat these as weak — there is not enough usable history.')}`;
+  }
+
+  function memberCardsHtml() {
+    return filteredRows().map((r,idx)=>{
+      const t=threatFor(r);
+      return `<div class="pwi-card"><div class="pwi-top"><div class="pwi-who"><div class="pwi-name">#${idx+1} ${esc(r.name)} [${r.id}]</div><div class="pwi-meta">Lvl ${r.level||'—'} • ${esc(r.position)} • ${r.days||'—'} days • ${esc(r.lastRelative)}</div></div><div class="pwi-score"><b>${r.eligible?r.activityScore:'—'}</b><span>ACTIVITY SCORE</span></div></div>
+      <div class="pwi-row"><div class="pwi-stat"><span>WAR PARTIC.</span><b>${r.eligible?`${Math.round(r.participation)}%`:'—'}</b></div><div class="pwi-stat"><span>ACTIVE WARS</span><b>${r.eligible?`${r.active}/${r.eligible}`:'—'}</b></div><div class="pwi-stat"><span>AVG HITS/WAR</span><b>${r.eligible?fmtNum(r.avg,1):'—'}</b></div><div class="pwi-stat"><span>MAX HITS</span><b>${r.eligible?fmtNum(r.maxHits):'—'}</b></div></div>
+      <div class="pwi-bottom"><span class="pwi-pill tone-${r.activityTone}">${esc(r.activityClass)}</span><span class="pwi-pill tone-${r.trendTone}">${esc(r.trendLabel)}</span><span class="pwi-pill tone-${t.tone}">THREAT ${esc(t.label)}</span><span class="pwi-pill tone-purple">EST. MIN ${r.eligible?`${fmtNum(r.avgEnergyMin,0)}E/WAR`:'—'}</span><span class="pwi-pill tone-${r.liveTone}">NOW ${esc(r.live)}</span><div class="pwi-series">${seriesHtml(r,5)}</div><button class="pwi-btn pwi-detail" data-detail="${r.id}">DETAILS</button></div></div>`;
+    }).join('');
+  }
+
+  function factionWatchSummary() {
+    if (!state.watch || !state.watch.samples) return [];
+    const buckets=[];
+    for(let i=0;i<6;i++){
+      let total=0, active=0;
+      for(const r of state.roster){ const b=state.watch.players?.[String(r.id)]?.buckets?.[i]; if(b){ total+=num(b.total); active+=num(b.active20);} }
+      buckets.push({i,label:bucketLabel(i),total,activePct:total?active/total*100:0});
+    }
+    return buckets;
+  }
+
+  function watchHtml() {
+    const buckets=factionWatchSummary();
+    const samples=num(state.watch?.samples);
+    const started=state.watch?.started ? new Date(state.watch.started).toLocaleString() : 'Not started';
+    const sorted=state.rows.slice().sort((a,b)=>watchFor(b.id).activePct-watchFor(a.id).activePct || b.activityScore-a.activityScore);
+    return `<div class="pwi-section"><h3>🕒 PRE-WAR WATCH</h3><p>This tab records current member Last Action snapshots every ~5 minutes for the selected faction while Torn is allowed to run this userscript. It is <b>observed general Torn activity</b>, not historical proof of when they make war attacks.</p><div class="pwi-badge-row"><span class="pwi-pill tone-blue">${samples} SNAPSHOTS</span><span class="pwi-pill tone-grey">STARTED ${esc(started)}</span></div></div>
+      <div class="pwi-section"><h3>FACTION ACTIVITY BY TCT WINDOW</h3><div class="pwi-watchgrid">${buckets.map(b=>`<div class="pwi-hour"><div class="pwi-hour-top"><b>${b.label}</b><span>${b.total?`${Math.round(b.activePct)}% observed active`:'No samples'}</span></div><div class="pwi-hourbar"><div class="pwi-hourfill" style="width:${Math.min(100,b.activePct)}%"></div></div></div>`).join('') || '<div class="pwi-muted">No watch data yet.</div>'}</div></div>
+      <div class="pwi-section"><h3>MEMBER WATCH</h3>${sorted.map(r=>{const w=watchFor(r.id),t=threatFor(r);return `<div class="pwi-mini"><div class="pwi-mini-top"><div class="pwi-mini-name">${esc(r.name)} [${r.id}]</div><span class="pwi-pill tone-${t.tone}">${esc(t.label)}</span><button class="pwi-btn" data-detail="${r.id}">DETAILS</button></div><div class="pwi-mini-meta">Observed ${w.total}× • active ≤20m in ${w.total?Math.round(w.activePct):0}% of samples • best: ${w.best.length?w.best.map(x=>`${x.label} ${Math.round(x.activePct)}%`).join(' / '):'not enough samples'}</div></div>`}).join('')}</div>`;
+  }
+
+  function keyScreen() {
+    return `<div id="${UI}-panel"><div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">MY FACTION + ENEMY WAR PROFILE</div></div><button class="pwi-btn" data-act="close">✕</button></div><div class="pwi-keybox"><h3 style="color:#82ff95;margin:0 0 6px">Torn API Key</h3><div class="pwi-keynote">The key is saved on this device and used only for Torn API calls. No external server is used.</div><input id="pwi-key" type="password" placeholder="Paste Torn API key"><button class="pwi-btn" data-act="savekey">SAVE KEY & BUILD PROFILE</button></div></div>`;
+  }
+
+  async function openWarSelector() {
+    if (!state.apiKey || !state.targetId || state.analyzing) return;
+    try {
+      if (!state.availableWars.length) {
+        state.analyzing = true; state.progress = 'Loading completed wars…'; render();
+        state.availableWars = await discoverCompletedWars(state.warCatalogLimit);
+        state.analyzing = false; render();
+      }
+    } catch (e) {
+      state.analyzing = false; state.error = e?.message || String(e); render(); return;
+    }
+
+    const selected = new Set((state.selectedWarIds.length ? state.selectedWarIds : loadSelectedWarIds(state.targetId)).map(String));
+    const shade = document.createElement('div');
+    shade.className = 'pwi-shade';
+    shade.innerHTML = `<div class="pwi-modal pwi-warselect-modal">
+      <div class="pwi-warselect-head">
+        <div class="pwi-warselect-headtxt"><h3>🕵️ SELECT WARS TO COMPARE</h3><div class="pwi-warselect-summary">Choose the exact completed ranked wars to use. Every profile, player average, participation %, trend, concentration and energy estimate recalculates from only the checked wars.</div></div>
+        <button class="pwi-btn pwi-warselect-close" data-ws="cancel" aria-label="Close war selector">✕</button>
+      </div>
+      <div class="pwi-warselect-tools"><div class="pwi-actions" style="justify-content:flex-start;margin-top:0">
+        <button class="pwi-btn" data-ws="all">SELECT ALL</button>
+        <button class="pwi-btn" data-ws="none">CLEAR</button>
+        <button class="pwi-btn" data-ws="five">NEWEST 5</button>
+        <button class="pwi-btn" data-ws="ten">NEWEST 10</button>
+      </div></div>
+      <div class="pwi-warselect-scroll"><div class="pwi-warselect-list">${state.availableWars.map(w=>{
+        const opp=opponentFromWarObject(w.rw,state.targetId);
+        return `<label class="pwi-warchoice"><input type="checkbox" data-war-id="${esc(w.id)}" ${selected.has(String(w.id))?'checked':''}><span class="pwi-warchoice-main"><b>${esc(fmtDate(w.end||w.start))}${opp.name?` • vs ${esc(opp.name)}`:''}</b><span>War #${esc(w.id)}${w.source==='news'?' • historical':''}</span></span></label>`;
+      }).join('') || '<div class="pwi-muted">No completed wars found.</div>'}</div></div>
+      <div class="pwi-warselect-footer"><button class="pwi-btn" data-ws="cancel">CANCEL</button><button class="pwi-btn" data-ws="apply">APPLY COMPARISON</button></div>
+    </div>`;
+    document.body.appendChild(shade);
+    const checks=()=>[...shade.querySelectorAll('[data-war-id]')];
+    shade.querySelector('[data-ws="all"]')?.addEventListener('click',()=>checks().forEach(c=>c.checked=true));
+    shade.querySelector('[data-ws="none"]')?.addEventListener('click',()=>checks().forEach(c=>c.checked=false));
+    shade.querySelector('[data-ws="five"]')?.addEventListener('click',()=>checks().forEach((c,i)=>c.checked=i<5));
+    shade.querySelector('[data-ws="ten"]')?.addEventListener('click',()=>checks().forEach((c,i)=>c.checked=i<10));
+    shade.querySelectorAll('[data-ws="cancel"]').forEach(b=>b.addEventListener('click',()=>shade.remove()));
+    shade.querySelector('[data-ws="apply"]')?.addEventListener('click',()=>{
+      saveSelectedWarIds(state.targetId,checks().filter(c=>c.checked).map(c=>String(c.dataset.warId)));
+      shade.remove(); state.reports=[]; buildAnalysisRows(); render(); analyzeHistory(false);
+    });
+    shade.addEventListener('click',e=>{if(e.target===shade)shade.remove();});
+    const onKey = e => { if (e.key === 'Escape') { shade.remove(); document.removeEventListener('keydown', onKey, true); } };
+    document.addEventListener('keydown', onKey, true);
+  }
+
+  function panelHtml() {
+    if (!state.apiKey) return keyScreen();
+    const factionName=currentFactionName(state.target||{}), tag=currentFactionTag(state.target||{});
+    const body = state.view==='profile' ? profileHtml() : state.view==='team' ? teamHtml() : state.view==='members' ? memberCardsHtml() : state.view==='watch' ? watchHtml() : helpHtml();
+    return `<div id="${UI}-panel"><div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">${phaseLabel()} • ${esc(factionName)} ${tag?`[${esc(tag)}]`:''} • ${esc(state.analyzing?state.progress:(state.progress||'READY'))}</div></div><button class="pwi-btn" data-act="scan" ${state.loading||state.analyzing?'disabled':''}>${state.loading?'SCANNING…':'SCAN'}</button><button class="pwi-btn" data-act="close">✕</button></div>
+      ${state.error?`<div class="pwi-error"><b>ERROR:</b> ${esc(state.error)}</div>`:''}${state.warning?`<div class="pwi-warn">${esc(state.warning)}</div>`:''}
+      <div class="pwi-scope"><button class="pwi-scopebtn ${state.scope==='own'?'active':''}" data-scope="own">🏠 MY FACTION</button><button class="pwi-scopebtn ${state.scope==='enemy'?'active':''}" data-scope="enemy">🎯 ENEMY</button></div>
+      <div class="pwi-tabs">${[['profile','WAR PROFILE'],['team','WAR TEAM'],['members','MEMBERS'],['watch','PRE-WAR WATCH'],['help','HOW TO READ']].map(([v,l])=>`<button class="pwi-tab ${state.view===v?'active':''}" data-view="${v}">${l}</button>`).join('')}</div>
+      ${state.view==='members'?`<div class="pwi-toolbar"><input id="pwi-search" value="${esc(state.filter)}" placeholder="Search member / ID / role…"><select id="pwi-sort"><option value="activityScore"${state.sort==='activityScore'?' selected':''}>War activity</option><option value="participation"${state.sort==='participation'?' selected':''}>Participation %</option><option value="avg"${state.sort==='avg'?' selected':''}>Avg hits</option><option value="totalHits"${state.sort==='totalHits'?' selected':''}>Total hits</option><option value="recent"${state.sort==='recent'?' selected':''}>Last war hits</option><option value="live"${state.sort==='live'?' selected':''}>Current activity</option><option value="level"${state.sort==='level'?' selected':''}>Level</option></select></div>`:''}
+      <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><button class="pwi-btn" data-act="wars" ${state.analyzing?'disabled':''}>SELECT WARS (${state.selectedWarIds.length})</button><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>RESCAN SELECTED</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
+      <div class="pwi-body">${body}</div></div>`;
+  }
+
+  function render() {
+    ensureUi();
+    const old = document.getElementById(`${UI}-panel`);
+    const oldBody = old?.querySelector('.pwi-body');
+    const scroll = oldBody?.scrollTop || 0;
+    old?.remove();
+    if (!state.open) return;
+
+    const holder = document.createElement('div');
+    holder.innerHTML = panelHtml();
+    document.body.appendChild(holder.firstElementChild);
+    bindUi();
+
+    const body = document.querySelector(`#${UI}-panel .pwi-body`);
+    if (body) body.scrollTop = scroll;
+  }
+
+  function detailModal(id) {
+    const r = state.rows.find(x => num(x.id) === num(id));
+    if (!r) return;
+
+    const warRows = state.reports.map((rep, i) => {
+      const m = rep.members.find(x => num(x.id) === num(r.id));
+      return `<tr>
+        <td>${fmtDate(rep.end || rep.start)}</td>
+        <td>${esc(rep.opponentName || 'Opponent')}</td>
+        <td>${esc(rep.result || '—')}</td>
+        <td>${m ? fmtNum(m.attacks) : '—'}</td>
+        <td>${m ? `${fmtNum(num(m.attacks)*25,0)}E` : '—'}</td>
+        <td>${m ? fmtNum(m.score,1) : '—'}</td>
+      </tr>`;
+    }).join('');
+
+    const shade = document.createElement('div');
+    shade.className = 'pwi-shade';
+    shade.innerHTML = `<div class="pwi-modal">
+      <h3>☣ ${esc(r.name)} [${r.id}]</h3>
+      <div class="pwi-badge-row"><span class="pwi-pill tone-${r.activityTone}">${esc(r.activityClass)}</span><span class="pwi-pill tone-${r.trendTone}">${esc(r.trendLabel)}</span><span class="pwi-pill tone-${threatFor(r).tone}">THREAT ${esc(threatFor(r).label)}</span></div>
+      <div class="pwi-row" style="margin-bottom:9px">
+        <div class="pwi-stat"><span>PARTICIPATION</span><b>${r.eligible ? `${Math.round(r.participation)}%` : '—'}</b></div>
+        <div class="pwi-stat"><span>ACTIVE WARS</span><b>${r.active}/${r.eligible}</b></div>
+        <div class="pwi-stat"><span>AVG HITS</span><b>${r.eligible ? fmtNum(r.avg,1) : '—'}</b></div>
+        <div class="pwi-stat"><span>MAX HITS</span><b>${r.eligible ? r.maxHits : '—'}</b></div>
+      </div>
+      <div class="pwi-row" style="margin-bottom:9px">
+        <div class="pwi-stat"><span>EST. MIN E / WAR</span><b>${r.eligible ? `${fmtNum(r.avgEnergyMin,0)}E` : '—'}</b></div>
+        <div class="pwi-stat"><span>EST. MIN E / ACTIVE WAR</span><b>${r.active ? `${fmtNum(r.avgEnergyActiveMin,0)}E` : '—'}</b></div>
+        <div class="pwi-stat"><span>EST. MIN TOTAL E</span><b>${r.eligible ? `${fmtNum(r.totalEnergyMin,0)}E` : '—'}</b></div>
+        <div class="pwi-stat"><span>EST. MIN MAX-WAR E</span><b>${r.eligible ? `${fmtNum(r.maxEnergyMin,0)}E` : '—'}</b></div>
+      </div>
+      <div class="pwi-note" style="margin-bottom:9px">Energy is a minimum estimate from recorded attacks × 25E, not exact net energy spent.</div>
+      <table>
+        <thead><tr><th>WAR</th><th>OPPONENT</th><th>W/L</th><th>HITS</th><th>EST. MIN E</th><th>SCORE</th></tr></thead>
+        <tbody>${warRows || '<tr><td colspan="6">No war history.</td></tr>'}</tbody>
+      </table>
+      <div class="pwi-actions">
+        <button class="pwi-btn" data-mprofile>PROFILE</button>
+        <button class="pwi-btn" data-mclose>CLOSE</button>
+      </div>
+    </div>`;
+    document.body.appendChild(shade);
+    shade.querySelector('[data-mclose]').onclick = () => shade.remove();
+    shade.querySelector('[data-mprofile]').onclick = () => window.open(`https://www.torn.com/profiles.php?XID=${r.id}`, '_blank');
+    shade.addEventListener('click', e => { if (e.target === shade) shade.remove(); });
+  }
+
+  function exportCsv() {
+    const out = [['Name','ID','Level','Position','Days in faction','Activity class','Activity score','Wars listed','Wars active','Participation %','Total RW attacks','Avg attacks per listed war','Avg attacks when active','Max attacks','Est min total energy','Est min avg energy per war','Est min avg energy per active war','Est min max-war energy','Last war','War -2','War -3','War -4','War -5','Current last action']];
+    for (const r of filteredRows()) {
+      const s = (r.series || []).slice(0,5).map(v => v === null ? '' : v);
+      while (s.length < 5) s.push('');
+      out.push([
+        r.name,r.id,r.level,r.position,r.days,r.activityClass,r.activityScore,r.eligible,r.active,
+        r.eligible ? r.participation.toFixed(1) : '',r.totalHits,
+        r.eligible ? r.avg.toFixed(2) : '',r.active ? r.avgWhenActive.toFixed(2) : '',
+        r.maxHits,
+        r.eligible ? r.totalEnergyMin.toFixed(0) : '',
+        r.eligible ? r.avgEnergyMin.toFixed(2) : '',
+        r.active ? r.avgEnergyActiveMin.toFixed(2) : '',
+        r.eligible ? r.maxEnergyMin.toFixed(0) : '',
+        ...s,r.lastRelative
+      ]);
+    }
+    const csv = out.map(row => row.map(v => `"${String(v ?? '').replace(/"/g,'""')}"`).join(',')).join('\n');
+    const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `wrath-war-intel-${state.scope}-${state.targetId || 'faction'}-${Date.now()}.csv`;
+    a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href),5000);
+  }
+
+  function bindUi() {
+    const p=document.getElementById(`${UI}-panel`); if(!p) return;
+    p.querySelector('[data-act="close"]')?.addEventListener('click',()=>{state.open=false;render();});
+    p.querySelectorAll('[data-scope]').forEach(btn=>btn.addEventListener('click',()=>{
+      const next = btn.dataset.scope === 'enemy' ? 'enemy' : 'own';
+      if (next === state.scope) return;
+      state.scope = next;
+      storageSet('prewarScope', state.scope);
+      state.target = null; state.targetId = 0; state.reports = []; state.rows = []; state.availableWars = []; state.selectedWarIds = []; state.watch = null;
+      state.error = ''; state.warning = ''; state.progress = ''; state.view = 'profile';
+      render();
+      scanBase({analyze:true,forceHistory:false});
+    }));
+    p.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('click',()=>{state.view=btn.dataset.view||'profile';render();}));
+    p.querySelector('[data-act="scan"]')?.addEventListener('click',()=>scanBase({analyze:true,forceHistory:false}));
+    p.querySelector('[data-act="wars"]')?.addEventListener('click',openWarSelector);
+    p.querySelector('[data-act="history"]')?.addEventListener('click',()=>analyzeHistory(true));
+    p.querySelector('[data-act="export"]')?.addEventListener('click',exportCsv);
+    p.querySelector('[data-act="key"]')?.addEventListener('click',()=>{state.apiKey='';storageSet('apiKey','');render();});
+    p.querySelector('[data-act="savekey"]')?.addEventListener('click',()=>{const v=p.querySelector('#pwi-key')?.value?.trim();if(!v)return;state.apiKey=v;storageSet('apiKey',v);render();scanBase({analyze:true,forceHistory:true});});
+    p.querySelector('#pwi-search')?.addEventListener('input',e=>{state.filter=e.target.value;render();const el=document.getElementById('pwi-search');if(el){el.focus();try{el.setSelectionRange(el.value.length,el.value.length)}catch(_){}}});
+    p.querySelector('#pwi-sort')?.addEventListener('change',e=>{state.sort=e.target.value;render();});
+    p.querySelectorAll('[data-detail]').forEach(btn=>btn.addEventListener('click',()=>detailModal(btn.dataset.detail)));
+  }
+
+  async function liveRefresh() {
+    if (!state.apiKey || !state.targetId || state.loading || state.analyzing) return;
+    try {
+      const target = state.scope === 'own'
+        ? await apiV1('/faction/?selections=basic,rankedwars')
+        : await apiV1(`/faction/${state.targetId}?selections=basic,rankedwars`);
+      state.target = target;
+      state.roster = rosterRows(target);
+      if (!state.watch) loadWatch(state.targetId);
+      recordWatchSnapshot(false);
+      if (state.reports.length) buildAnalysisRows();
+      state.lastScan = Date.now();
+      if (state.open) render();
+    } catch (_) {}
+  }
+
+  async function backgroundWatch() {
+    if (!state.apiKey) return;
+    if (!state.targetId) { await scanBase({analyze:false,forceHistory:false}); return; }
+    await liveRefresh();
+  }
+
+  function init() {
+    state.apiKey=storageGet('apiKey',''); ensureUi();
+    clearInterval(state.timer); clearInterval(state.watchTimer); clearInterval(state.rediscoverTimer);
+    state.timer=setInterval(()=>{ if(state.open) liveRefresh(); },LIVE_REFRESH_MS);
+    state.watchTimer=setInterval(backgroundWatch,WATCH_REFRESH_MS);
+    state.rediscoverTimer=setInterval(()=>{ if(state.apiKey) scanBase({analyze:false,forceHistory:false}); },REDISCOVER_MS);
+    if(state.apiKey) setTimeout(()=>scanBase({analyze:false,forceHistory:false}),1800);
+    let headerMountTimer = null;
+    const obs = new MutationObserver(() => {
+      const b = document.getElementById(`${UI}-btn`);
+      if (b?.isConnected && lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) return;
+      clearTimeout(headerMountTimer);
+      headerMountTimer = setTimeout(ensureUi, 180);
+    });
+    obs.observe(document.documentElement,{childList:true,subtree:true});
+  }
+
+  init();
 })();
