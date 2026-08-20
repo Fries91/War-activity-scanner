@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.5.1
-// @description  PDA-first war intelligence with exact war selection, faction/enemy comparison, stable Torn header spy icon, energy estimates, trends, and automatic script updates.
+// @version      3.6.0
+// @description  Standalone PDA-first war intelligence with exact war selection, termed-war graph detection, faction/enemy comparison, energy estimates, trends, and automatic updates.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @icon         https://www.torn.com/favicon.ico
-// @updateURL    https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/war-activity-scanner.user.js
-// @downloadURL  https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/war-activity-scanner.user.js
+// @updateURL    https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/War%20activity%20script
+// @downloadURL  https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/War%20activity%20script
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.5.1';
-  const BUILD = 'WAR-SELECTOR-PDA-EXIT-FIX-20260820';
+  const VERSION = '3.6.0';
+  const BUILD = 'TERM-GRAPH-DETECTOR-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -46,9 +46,11 @@
     currentWar: null,
     roster: [],
     reports: [],
+    loadedReports: [],
     rows: [],
     availableWars: [],
     selectedWarIds: [],
+    warTypeFilter: 'all',
     warCatalogLimit: 30,
     sort: 'activityScore',
     filter: '',
@@ -128,9 +130,13 @@
         }
       };
 
-      if (typeof GM_xmlhttpRequest === 'function') {
+      const gmRequest =
+        (typeof GM_xmlhttpRequest === 'function' && GM_xmlhttpRequest) ||
+        (typeof GM !== 'undefined' && typeof GM.xmlHttpRequest === 'function' && GM.xmlHttpRequest.bind(GM));
+
+      if (gmRequest) {
         try {
-          GM_xmlhttpRequest({
+          gmRequest({
             method: 'GET',
             url,
             timeout: 20000,
@@ -142,6 +148,8 @@
         } catch (_) {}
       }
 
+      // Last-resort browser request. This is only used for Torn API calls after
+      // the script has started; the script itself no longer fetches a remote payload.
       fetch(url, { credentials: 'omit', cache: 'no-store' })
         .then(r => r.text().then(t => finish(t, r.status)))
         .catch(() => reject(new Error('Could not reach Torn API.')));
@@ -441,6 +449,412 @@
   function loadReportByWar(targetId, warId) { return storageGet(reportCacheKey(targetId, warId), null); }
   function saveReportByWar(targetId, warId, report) { storageSet(reportCacheKey(targetId, warId), report); }
 
+  const TERM_GRAPH_ALGO = 1;
+
+  function warTypeFilterKey(targetId) { return `warTypeFilter:${targetId}`; }
+  function loadWarTypeFilter(targetId) {
+    const v = String(storageGet(warTypeFilterKey(targetId), 'all'));
+    return ['all','competitive','term'].includes(v) ? v : 'all';
+  }
+  function saveWarTypeFilter(targetId, value) {
+    const v = ['competitive','term'].includes(value) ? value : 'all';
+    state.warTypeFilter = v;
+    storageSet(warTypeFilterKey(targetId), v);
+  }
+
+  function termGraphCacheKey(warId) { return `termGraph:${warId}:v${TERM_GRAPH_ALGO}`; }
+  function loadTermGraph(warId) {
+    const c = storageGet(termGraphCacheKey(warId), null);
+    return c && c.result ? c.result : null;
+  }
+  function saveTermGraph(warId, result) {
+    storageSet(termGraphCacheKey(warId), { at: Date.now(), result });
+  }
+
+  function normalizeGraphTime(v) {
+    let t = num(v);
+    if (!t) return 0;
+    if (t > 10_000_000_000) t = Math.round(t / 1000);
+    return t;
+  }
+
+  function cleanGraphPoints(points) {
+    const clean = (points || []).map(p => ({
+      t: normalizeGraphTime(p?.t ?? p?.x ?? p?.time ?? p?.timestamp),
+      a: num(p?.a ?? p?.y1 ?? p?.score1),
+      b: num(p?.b ?? p?.y2 ?? p?.score2),
+    })).filter(p => p.t > 1_000_000_000 && p.a >= 0 && p.b >= 0)
+      .sort((x,y)=>x.t-y.t);
+
+    const merged = [];
+    for (const p of clean) {
+      const last = merged[merged.length - 1];
+      if (last && last.t === p.t) {
+        last.a = Math.max(last.a, p.a);
+        last.b = Math.max(last.b, p.b);
+      } else {
+        merged.push({...p});
+      }
+    }
+    return merged;
+  }
+
+  function graphCandidateScore(points) {
+    const p = cleanGraphPoints(points);
+    if (p.length < 6) return -1;
+    const span = p[p.length-1].t - p[0].t;
+    if (span < 15 * 60) return -1;
+    const finalMax = Math.max(p[p.length-1].a, p[p.length-1].b);
+    if (finalMax <= 0) return -1;
+
+    let mostlyOrdered = 0, checked = 0;
+    for (let i=1;i<p.length;i++) {
+      const da = p[i].a - p[i-1].a;
+      const db = p[i].b - p[i-1].b;
+      checked++;
+      if (da >= -Math.max(5, p[i-1].a * .08) && db >= -Math.max(5, p[i-1].b * .08)) mostlyOrdered++;
+    }
+    const ordered = checked ? mostlyOrdered / checked : 0;
+    return p.length + ordered * 30 + Math.min(20, Math.log10(finalMax + 1) * 5);
+  }
+
+  function pairGraphSeries(aRows, bRows) {
+    function cleanSeries(rows) {
+      return (rows || []).map(r => {
+        if (Array.isArray(r) && r.length >= 2) return {t: normalizeGraphTime(r[0]), v: num(r[1], NaN)};
+        if (r && typeof r === 'object') {
+          const t = normalizeGraphTime(r.x ?? r.t ?? r.time ?? r.timestamp ?? r.date);
+          const v = num(r.y ?? r.value ?? r.score ?? r.points, NaN);
+          return {t, v};
+        }
+        return {t:0,v:NaN};
+      }).filter(x => x.t > 1_000_000_000 && Number.isFinite(x.v) && x.v >= 0).sort((x,y)=>x.t-y.t);
+    }
+    const a = cleanSeries(aRows), b = cleanSeries(bRows);
+    if (a.length < 3 || b.length < 3) return [];
+    const times = [...new Set([...a.map(x=>x.t), ...b.map(x=>x.t)])].sort((x,y)=>x-y);
+    let ia=0, ib=0, va=0, vb=0;
+    const out=[];
+    for (const t of times) {
+      while (ia < a.length && a[ia].t <= t) { va = a[ia].v; ia++; }
+      while (ib < b.length && b[ib].t <= t) { vb = b[ib].v; ib++; }
+      out.push({t,a:va,b:vb});
+    }
+    return cleanGraphPoints(out);
+  }
+
+  function arrayToGraphPoints(arr) {
+    if (!Array.isArray(arr) || arr.length < 4) return [];
+    if (arr.every(r => Array.isArray(r) && r.length >= 3)) {
+      const p = arr.map(r => ({t:r[0],a:r[1],b:r[2]}));
+      if (graphCandidateScore(p) >= 0) return cleanGraphPoints(p);
+    }
+    if (arr.every(r => r && typeof r === 'object' && !Array.isArray(r))) {
+      const p = [];
+      for (const row of arr) {
+        const t = normalizeGraphTime(row.timestamp ?? row.time ?? row.ts ?? row.x ?? row.date);
+        if (!t) continue;
+        if (Array.isArray(row.scores) && row.scores.length >= 2) {
+          p.push({t,a:row.scores[0],b:row.scores[1]});
+          continue;
+        }
+        const factions = row.factions || row.sides;
+        if (factions && typeof factions === 'object') {
+          const vals = Object.values(factions).map(v => num(v?.score ?? v?.points ?? v?.value ?? v, NaN)).filter(Number.isFinite);
+          if (vals.length >= 2) {
+            p.push({t,a:vals[0],b:vals[1]});
+            continue;
+          }
+        }
+        const priority = Object.entries(row)
+          .filter(([k,v]) => /score|points|value|y\d*$/i.test(k) && Number.isFinite(Number(v)))
+          .map(([k,v]) => Number(v));
+        if (priority.length >= 2) p.push({t,a:priority[0],b:priority[1]});
+      }
+      if (graphCandidateScore(p) >= 0) return cleanGraphPoints(p);
+    }
+    return [];
+  }
+
+  function extractBalancedArray(raw, bracketIndex) {
+    let depth = 0, quote = '', escaped = false;
+    for (let i=bracketIndex;i<raw.length;i++) {
+      const ch = raw[i];
+      if (quote) {
+        if (escaped) { escaped = false; continue; }
+        if (ch === '\\') { escaped = true; continue; }
+        if (ch === quote) quote = '';
+        continue;
+      }
+      if (ch === '"' || ch === "'") { quote = ch; continue; }
+      if (ch === '[') depth++;
+      else if (ch === ']') {
+        depth--;
+        if (depth === 0) return raw.slice(bracketIndex, i+1);
+      }
+    }
+    return '';
+  }
+
+  function extractGraphPointsFromHtml(html) {
+    const candidates = [];
+    const seriesSets = [];
+    const add = (points, source) => {
+      const cleaned = cleanGraphPoints(points);
+      const score = graphCandidateScore(cleaned);
+      if (score >= 0) candidates.push({points:cleaned, source, score});
+    };
+
+    const visit = (value, depth=0, seen=new WeakSet()) => {
+      if (depth > 7 || value == null || typeof value !== 'object') return;
+      if (seen.has(value)) return;
+      seen.add(value);
+
+      if (Array.isArray(value)) {
+        const direct = arrayToGraphPoints(value);
+        if (direct.length) add(direct, 'embedded-json');
+        const dataSeries = value
+          .filter(x => x && typeof x === 'object' && Array.isArray(x.data))
+          .map(x => x.data).filter(x => x.length >= 3);
+        if (dataSeries.length >= 2) {
+          const paired = pairGraphSeries(dataSeries[0], dataSeries[1]);
+          if (paired.length) add(paired, 'chart-series');
+        }
+        for (const x of value.slice(0, 500)) visit(x, depth+1, seen);
+        return;
+      }
+
+      if (Array.isArray(value.series) && value.series.length >= 2) {
+        const dataSeries = value.series.map(s => s?.data).filter(Array.isArray);
+        if (dataSeries.length >= 2) {
+          const paired = pairGraphSeries(dataSeries[0], dataSeries[1]);
+          if (paired.length) add(paired, 'chart-series');
+        }
+      }
+      for (const v of Object.values(value).slice(0, 200)) visit(v, depth+1, seen);
+    };
+
+    try {
+      const doc = new DOMParser().parseFromString(html, 'text/html');
+      for (const script of [...doc.querySelectorAll('script')]) {
+        const raw = script.textContent || '';
+        if (!raw) continue;
+        if ((script.type || '').includes('json') || /^[\s]*[\[{]/.test(raw)) {
+          try { visit(JSON.parse(raw)); } catch (_) {}
+        }
+
+        const re = /\bdata\s*:\s*\[/g;
+        let m;
+        while ((m = re.exec(raw)) && seriesSets.length < 20) {
+          const start = raw.indexOf('[', m.index);
+          const block = extractBalancedArray(raw, start);
+          if (!block || block.length > 2_000_000) continue;
+          try {
+            const arr = JSON.parse(block);
+            if (Array.isArray(arr) && arr.length >= 3 && arr.every(r=>Array.isArray(r)&&r.length>=2)) seriesSets.push(arr);
+            const direct = arrayToGraphPoints(arr);
+            if (direct.length) add(direct, 'script-data');
+          } catch (_) {}
+        }
+      }
+
+      for (const el of [...doc.querySelectorAll('*')].slice(0, 5000)) {
+        for (const attr of [...(el.attributes || [])]) {
+          if (!/data|graph|chart|series/i.test(attr.name) || attr.value.length < 20) continue;
+          const raw = attr.value.replace(/&quot;/g,'"').replace(/&#39;/g,"'");
+          if (!/[\[{]/.test(raw)) continue;
+          try { visit(JSON.parse(raw)); } catch (_) {}
+        }
+      }
+    } catch (_) {}
+
+    if (seriesSets.length >= 2) {
+      for (let i=0;i<Math.min(seriesSets.length,6);i++) {
+        for (let j=i+1;j<Math.min(seriesSets.length,6);j++) {
+          const paired = pairGraphSeries(seriesSets[i], seriesSets[j]);
+          if (paired.length) add(paired, 'script-series-pair');
+        }
+      }
+    }
+
+    const triples = [];
+    const tripleRe = /\[\s*(\d{10,13})\s*,\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]/g;
+    let tm;
+    while ((tm = tripleRe.exec(html)) && triples.length < 5000) triples.push({t:tm[1],a:tm[2],b:tm[3]});
+    if (triples.length >= 6) add(triples, 'literal-triples');
+
+    candidates.sort((a,b)=>b.score-a.score);
+    return candidates[0] || {points:[],source:'none',score:-1};
+  }
+
+  function classifyTermGraph(points, report) {
+    const p = cleanGraphPoints(points);
+    if (p.length < 6) return {
+      available:false, likelihood:null, label:'NO GRAPH DATA', tone:'grey',
+      source:'none', points:p.length, reasons:['The ranked-war page did not expose enough graph points to classify this war.']
+    };
+
+    const start = p[0].t, end = p[p.length-1].t;
+    const duration = Math.max(1, end-start);
+    const dts = [];
+    let flatTime=0, decayTime=0, activeTime=0, totalPositive=0, latePositive=0, decayEvents=0;
+    let maxFlatRun=0, flatRun=0, maxGap=0;
+    const scorerSeq=[], leadSeq=[];
+    const lateStart = start + duration * .85;
+
+    for (let i=0;i<p.length;i++) {
+      const lead = Math.sign(p[i].a - p[i].b);
+      if (lead && leadSeq[leadSeq.length-1] !== lead) leadSeq.push(lead);
+      if (!i) continue;
+      const dt = Math.max(1, p[i].t-p[i-1].t);
+      dts.push(dt);
+      maxGap = Math.max(maxGap, dt);
+      const da = p[i].a-p[i-1].a, db=p[i].b-p[i-1].b;
+      const posA=Math.max(0,da), posB=Math.max(0,db);
+      const positive=posA+posB;
+      const decay=Math.max(0,-da)+Math.max(0,-db);
+
+      if (positive <= .0001) {
+        flatTime += dt;
+        flatRun += dt;
+        maxFlatRun = Math.max(maxFlatRun, flatRun);
+      } else {
+        activeTime += dt;
+        flatRun = 0;
+        totalPositive += positive;
+        if (p[i].t >= lateStart) latePositive += positive;
+        const scorer = posA > posB ? 1 : posB > posA ? -1 : 0;
+        if (scorer && scorerSeq[scorerSeq.length-1] !== scorer) scorerSeq.push(scorer);
+      }
+      if (decay > .0001) {
+        decayTime += dt;
+        decayEvents++;
+      }
+    }
+
+    const sortedDt = dts.slice().sort((a,b)=>a-b);
+    const medianDt = sortedDt.length ? sortedDt[Math.floor(sortedDt.length/2)] : 0;
+    const periodicSampling = medianDt > 0 && medianDt <= 35*60;
+    const flatRatio = periodicSampling ? flatTime/duration : 0;
+    const maxQuiet = Math.max(maxFlatRun, maxGap);
+    const maxQuietRatio = maxQuiet/duration;
+    const decayRatio = decayTime/duration;
+    const activeDensity = activeTime/duration;
+    const lateShare = totalPositive ? latePositive/totalPositive : 0;
+    const leadChanges = Math.max(0, leadSeq.length-1);
+    const scorerSwitches = Math.max(0, scorerSeq.length-1);
+    const scorerSwitchRate = scorerSeq.length > 1 ? scorerSwitches/(scorerSeq.length-1) : 0;
+
+    const finalA = num(report?.targetScore, p[p.length-1].a);
+    const finalB = num(report?.otherScore, p[p.length-1].b);
+    const hi = Math.max(finalA,finalB), lo=Math.min(finalA,finalB);
+    const loserRatio = hi > 0 ? lo/hi : 0;
+
+    let likelihood = 8;
+    const reasons=[];
+
+    if (maxQuiet >= 60*60 && maxQuietRatio >= .18) {
+      likelihood += 24; reasons.push(`Very long quiet/plateau section (${Math.round(maxQuiet/360)/10}h).`);
+    } else if (maxQuiet >= 45*60 && maxQuietRatio >= .10) {
+      likelihood += 13; reasons.push(`Noticeable quiet/plateau section (${Math.round(maxQuiet/60)}m).`);
+    }
+    if (flatRatio >= .35) {
+      likelihood += 16; reasons.push(`${Math.round(flatRatio*100)}% of sampled graph time is flat.`);
+    } else if (flatRatio >= .20) {
+      likelihood += 8; reasons.push(`${Math.round(flatRatio*100)}% of sampled graph time is flat.`);
+    }
+    if (decayEvents >= 3 || decayRatio >= .10) {
+      likelihood += 15; reasons.push(`Score-decay / no-scoring pattern appears ${decayEvents} times.`);
+    } else if (decayEvents >= 1) {
+      likelihood += 6; reasons.push('The graph contains a score-decay segment.');
+    }
+    if (loserRatio >= .18 && loserRatio <= .38) {
+      likelihood += 15; reasons.push(`Final loser/winner score ratio is ${Math.round(loserRatio*100)}%.`);
+    } else if (loserRatio > .38 && loserRatio <= .60) {
+      likelihood += 6; reasons.push(`Final score ratio is controlled-looking at ${Math.round(loserRatio*100)}%.`);
+    }
+    if (leadChanges <= 1 && duration >= 4*3600) {
+      likelihood += 8; reasons.push(`Only ${leadChanges} meaningful lead change${leadChanges===1?'':'s'} across the graph.`);
+    } else if (leadChanges >= 4) {
+      likelihood -= 14; reasons.push(`${leadChanges} lead changes look more competitive.`);
+    }
+    if (scorerSeq.length >= 7 && scorerSwitchRate >= .60) {
+      likelihood += 7; reasons.push('Scoring switches sides in an unusually orderly pattern.');
+    }
+    if (lateShare >= .45 && maxQuietRatio >= .08) {
+      likelihood += 8; reasons.push(`${Math.round(lateShare*100)}% of scoring arrives in the final 15% after quieter graph sections.`);
+    }
+    if (duration >= 18*3600 && activeDensity < .50) {
+      likelihood += 6; reasons.push('Long war duration with relatively sparse scoring periods.');
+    }
+    if (leadChanges >= 4 && flatRatio < .12 && maxQuietRatio < .08) likelihood -= 12;
+    if (periodicSampling && activeDensity > .75 && maxQuietRatio < .06) likelihood -= 10;
+
+    likelihood = Math.max(0, Math.min(100, Math.round(likelihood)));
+    let label='LIKELY COMPETITIVE', tone='green';
+    if (likelihood >= 75) { label='VERY LIKELY TERM-LIKE'; tone='red'; }
+    else if (likelihood >= 55) { label='POSSIBLY TERM-LIKE'; tone='orange'; }
+
+    return {
+      available:true, likelihood, label, tone, points:p.length,
+      reasons: reasons.slice(0,5),
+      features:{
+        durationHours:duration/3600, flatRatio, maxQuietRatio, maxQuietSeconds:maxQuiet,
+        decayEvents, decayRatio, loserRatio, leadChanges, scorerSwitchRate, lateShare, activeDensity
+      }
+    };
+  }
+
+  async function fetchTermGraphAnalysis(report, force=false) {
+    if (!force) {
+      const cached = loadTermGraph(report.id);
+      if (cached) return cached;
+    }
+    let result;
+    try {
+      const url = `/war.php?step=rankreport&rankID=${encodeURIComponent(report.id)}`;
+      const r = await fetch(url, { credentials:'include', cache:'no-store' });
+      if (!r.ok) throw new Error(`War graph HTTP ${r.status}`);
+      const html = await r.text();
+      const extracted = extractGraphPointsFromHtml(html);
+      result = classifyTermGraph(extracted.points, report);
+      result.source = extracted.source;
+      if (!result.available) result.reasons = ['Torn returned the report, but the graph series was not exposed in a format this scanner could read.'];
+    } catch (e) {
+      result = {
+        available:false, likelihood:null, label:'NO GRAPH DATA', tone:'grey', source:'fetch-failed', points:0,
+        reasons:[e?.message || 'Could not read the ranked-war graph.']
+      };
+    }
+    saveTermGraph(report.id, result);
+    return result;
+  }
+
+  function applyWarTypeFilter() {
+    const all = state.loadedReports || [];
+    if (state.warTypeFilter === 'term') {
+      state.reports = all.filter(r => r.termGraph?.available && num(r.termGraph.likelihood) >= 55);
+    } else if (state.warTypeFilter === 'competitive') {
+      state.reports = all.filter(r => r.termGraph?.available && num(r.termGraph.likelihood) < 55);
+    } else {
+      state.reports = all.slice();
+    }
+  }
+
+  function termSummary() {
+    const all = state.loadedReports || [];
+    const known = all.filter(r=>r.termGraph?.available);
+    const term = known.filter(r=>num(r.termGraph.likelihood)>=55);
+    const very = known.filter(r=>num(r.termGraph.likelihood)>=75);
+    const competitive = known.filter(r=>num(r.termGraph.likelihood)<55);
+    const unknown = all.length-known.length;
+    return {
+      all:all.length, known:known.length, term:term.length, very:very.length,
+      competitive:competitive.length, unknown,
+      termRate:known.length ? term.length/known.length*100 : 0
+    };
+  }
+
   function opponentFromWarObject(rw, targetId) {
     const entries = factionEntries(warFactions(rw || {}));
     const other = entries.find(([id, f]) => num(id) !== num(targetId));
@@ -655,6 +1069,7 @@
       if (selected.join('|') !== state.selectedWarIds.join('|')) saveSelectedWarIds(state.targetId, selected);
 
       if (!state.availableWars.length) {
+        state.loadedReports = [];
         state.reports = [];
         buildAnalysisRows();
         state.warning = 'No completed ranked wars were found for this faction.';
@@ -662,6 +1077,7 @@
         return;
       }
       if (!selected.length) {
+        state.loadedReports = [];
         state.reports = [];
         buildAnalysisRows();
         state.warning = `Choose the exact wars you want to compare. ${state.availableWars.length} completed wars are available.`;
@@ -673,6 +1089,7 @@
       const wars = state.availableWars.filter(w => chosen.has(String(w.id)));
       const reports = [];
       const errors = [];
+      let graphMissing = 0;
       for (let i = 0; i < wars.length; i++) {
         state.progress = `Reading selected war ${i + 1} / ${wars.length}`;
         render();
@@ -682,15 +1099,28 @@
             report = await fetchRankedWarReport(wars[i]);
             if (report) saveReportByWar(state.targetId, wars[i].id, report);
           }
-          if (report) reports.push(report);
+          if (report) {
+            state.progress = `War ${i + 1}/${wars.length} • reading graph pattern`;
+            render();
+            report.termGraph = await fetchTermGraphAnalysis(report, force);
+            if (!report.termGraph?.available) graphMissing++;
+            reports.push(report);
+          }
         } catch (e) { errors.push(e?.message || String(e)); }
-        await sleep(140);
+        await sleep(160);
       }
 
-      state.reports = reports.sort((a,b)=>(b.end||b.start)-(a.end||a.start));
+      state.loadedReports = reports.sort((a,b)=>(b.end||b.start)-(a.end||a.start));
+      applyWarTypeFilter();
       buildAnalysisRows();
-      state.warning = errors.length ? `${reports.length}/${wars.length} selected war reports loaded. ${errors.length} unavailable.` : '';
-      state.progress = `${reports.length} selected wars compared`;
+
+      const notices = [];
+      if (errors.length) notices.push(`${reports.length}/${wars.length} selected war reports loaded; ${errors.length} unavailable.`);
+      if (graphMissing) notices.push(`${graphMissing} war graph${graphMissing===1?'':'s'} could not be classified.`);
+      if (state.warTypeFilter !== 'all' && !state.reports.length && reports.length) notices.push('No loaded wars match the current WAR TYPE filter.');
+      state.warning = notices.join(' ');
+      const filterName = state.warTypeFilter === 'term' ? 'TERM-LIKE' : state.warTypeFilter === 'competitive' ? 'COMPETITIVE-LIKE' : 'ALL';
+      state.progress = `${state.reports.length}/${reports.length} wars • ${filterName}`;
       state.lastScan = Date.now();
     } finally {
       state.analyzing = false;
@@ -734,6 +1164,8 @@
       if (targetChanged) {
         state.availableWars = [];
         state.selectedWarIds = loadSelectedWarIds(state.targetId);
+        state.warTypeFilter = loadWarTypeFilter(state.targetId);
+        state.loadedReports = [];
       }
       state.lastScan = Date.now();
 
@@ -741,6 +1173,7 @@
       recordWatchSnapshot(true);
 
       if (targetChanged) {
+        state.loadedReports = [];
         state.reports = [];
         state.rows = [];
       } else if (state.reports.length) {
@@ -921,6 +1354,8 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 .pwi-warchoice input{margin-top:2px;flex:0 0 auto;accent-color:#78ef8d}
 .pwi-warchoice-main{flex:1;min-width:0}.pwi-warchoice-main b{display:block;font-size:10px;color:#fff}.pwi-warchoice-main span{display:block;font-size:9px;color:#91a397;margin-top:2px}
 .pwi-warselect-summary{font-size:10px;color:#b9c7bd;margin:5px 0}
+.pwi-warfilter{display:flex;gap:5px;align-items:center;padding:5px 7px;background:#0e1511;border-top:1px solid #1e2a22;border-bottom:1px solid #29372e;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.pwi-warfilter::-webkit-scrollbar{display:none}.pwi-warfilter>span{font-size:9px;font-weight:900;color:#8fa095;white-space:nowrap}.pwi-warfilter .pwi-btn.active{background:#263b2d;border-color:#659071;color:#9cffab}
+.pwi-termwar{background:#101611;border:1px solid #29382f;border-radius:8px;padding:7px;margin-top:6px}.pwi-termwar-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.pwi-termwar-name{font-size:10px;font-weight:900;color:#fff;flex:1;min-width:160px}.pwi-termwar-meta{font-size:9px;color:#9fb0a5;margin-top:4px;line-height:1.35}.pwi-term-reasons{font-size:9px;color:#b8c6bd;margin-top:4px}.pwi-warchoice .pwi-term-mini{margin-left:auto;flex:0 0 auto}
 
 .pwi-keybox{padding:14px}.pwi-keybox input{width:100%;background:#090d0a;color:#fff;border:1px solid #44584a;border-radius:8px;padding:10px;margin:9px 0}.pwi-keynote{font-size:10px;color:#93a399;line-height:1.45}
 
@@ -1145,6 +1580,8 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
         <div class="pwi-helpitem"><b>WAR PARTICIPATION</b><span>Percent of analyzed wars in which that player made at least one attack, among reports where they were listed.</span></div>
         <div class="pwi-helpitem"><b>AVG HITS/WAR</b><span>Average attacks across wars where they were listed, including zero-hit appearances.</span></div>
         <div class="pwi-helpitem"><b>EST. MIN ENERGY/WAR</b><span>Average recorded ranked-war attacks × 25 energy. This is a minimum/gross estimate, not exact net energy. Failed offensive attempts or assists may not be represented by the report, while Revitalize can restore attack energy.</span></div>
+        <div class="pwi-helpitem"><b>TERM-LIKE GRAPH %</b><span>A local heuristic from the historical ranked-war graph. 75%+ = very likely term-like, 55–74% = possibly term-like, under 55% = likely competitive. It is evidence from graph shape, not proof that factions made an agreement.</span></div>
+        <div class="pwi-helpitem"><b>WAR TYPE FILTER</b><span>ALL uses every selected war. COMPETITIVE-LIKE excludes wars the graph detector scores at 55% or higher. TERM-LIKE uses only those 55%+ wars. Wars with unreadable graph data are excluded from the two filtered modes.</span></div>
         <div class="pwi-helpitem"><b>ACTIVITY SCORE</b><span>Our 0–100 comparison score combining participation, attack volume, and recent activity. It is not a Torn battle stat.</span></div>
         <div class="pwi-helpitem"><b>RECENT FORM</b><span>Compares roughly the newest three known wars with older known wars. Heating Up means recent attack volume has materially increased.</span></div>
       </div></div>
@@ -1156,10 +1593,11 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 
   function profileHtml() {
     const m=factionMetrics();
-    if (!state.reports.length) return `<div class="pwi-section"><h3>WAR PROFILE</h3><p>${state.analyzing ? esc(state.progress) : 'No completed war reports loaded yet. Tap RESCAN HISTORY.'}</p></div>`;
+    const ts=termSummary();
+    if (!state.reports.length) return `<div class="pwi-section"><h3>WAR PROFILE</h3><p>${state.analyzing ? esc(state.progress) : state.loadedReports.length ? 'No selected wars match the current WAR TYPE filter. Choose ALL or another filter.' : 'No completed war reports loaded yet. Select wars, then run the comparison.'}</p></div>`;
     const top=m.byHits[0];
     return `<div class="pwi-section"><h3>☣ ${state.scope==='own'?'MY FACTION WAR PROFILE':'ENEMY WAR PROFILE'}</h3><div class="pwi-note"><b>Comparison set:</b> ${state.reports.length} selected war${state.reports.length===1?'':'s'} loaded.</div>
-      <div class="pwi-badge-row"><span class="pwi-pill tone-${m.quality[1]}">DATA ${m.quality[0]}</span><span class="pwi-pill tone-blue">${state.reports.length} WARS READ</span><span class="pwi-pill tone-purple">${m.unknown} UNKNOWN CURRENT MEMBERS</span></div>
+      <div class="pwi-badge-row"><span class="pwi-pill tone-${m.quality[1]}">DATA ${m.quality[0]}</span><span class="pwi-pill tone-blue">${state.reports.length} WARS IN FILTER</span><span class="pwi-pill tone-orange">${ts.term} TERM-LIKE</span><span class="pwi-pill tone-green">${ts.competitive} COMPETITIVE-LIKE</span><span class="pwi-pill tone-grey">${ts.unknown} GRAPH UNKNOWN</span><span class="pwi-pill tone-purple">${m.unknown} UNKNOWN CURRENT MEMBERS</span></div>
       <div class="pwi-kpis" style="margin-top:7px">
         <div class="pwi-kpi"><span>LIKELY CORE</span><b>${m.coreRows.length}</b></div>
         <div class="pwi-kpi"><span>REGULAR HITTERS</span><b>${m.regularRows.length}</b></div>
@@ -1170,6 +1608,16 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
         <div class="pwi-kpi"><span>WINS IN DATA</span><b>${state.reports.filter(r=>['W','L'].includes(r.result)).length ? `${Math.round(m.winPct)}%` : '—'}</b></div>
       </div>
     </div>
+    <div class="pwi-section"><h3>🧭 TERMED-WAR GRAPH SCAN</h3>
+      <p>This is a <b>graph-pattern likelihood</b>, not proof of a deal. It looks for long plateaus/lulls, decay periods, controlled final score ratios, low lead-changing, orderly side-switching and late controlled finishes.</p>
+      <div class="pwi-badge-row"><span class="pwi-pill tone-orange">${ts.known?Math.round(ts.termRate):0}% TERM-LIKE OF CLASSIFIED</span><span class="pwi-pill tone-red">${ts.very} VERY LIKELY</span><span class="pwi-pill tone-grey">${ts.unknown} NO GRAPH DATA</span></div>
+      ${(state.loadedReports||[]).map(rep=>{
+        const g=rep.termGraph||{available:false,label:'NO GRAPH DATA',tone:'grey',reasons:['Graph not scanned yet.']};
+        const pct=g.available?`${g.likelihood}%`:'—';
+        return `<div class="pwi-termwar"><div class="pwi-termwar-top"><div class="pwi-termwar-name">${esc(fmtDate(rep.end||rep.start))} • vs ${esc(rep.opponentName||'Opponent')} • #${esc(rep.id)}</div><span class="pwi-pill tone-${g.tone}">${pct} ${esc(g.label)}</span></div><div class="pwi-termwar-meta">${g.available?`${g.points||0} graph points • ${fmtNum(g.features?.durationHours||0,1)}h graph span • lead changes ${g.features?.leadChanges??'—'} • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}%`:`Graph source unavailable (${esc(g.source||'none')}).`}</div><div class="pwi-term-reasons">${(g.reasons||[]).slice(0,3).map(x=>`• ${esc(x)}`).join('<br>')}</div></div>`;
+      }).join('')}
+    </div>
+
     <div class="pwi-section"><h3>${state.scope==='own'?'HOW WE APPEAR TO WAR':'HOW THEY APPEAR TO WAR'}</h3>${m.styles.map(s=>`<div class="pwi-style"><span class="pwi-pill tone-${s.tone}">${esc(s.label)}</span><span>${esc(s.why)}</span></div>`).join('')}</div>
     <div class="pwi-section"><h3>ATTACK CONCENTRATION — CURRENT ROSTER HISTORY</h3><p>How much of the loaded current-member attack production comes from the selected faction’s top hitters.</p>
       <div class="pwi-conc">${[[3,m.top3],[5,m.top5],[10,m.top10],[15,m.top15]].map(([n,v])=>`<div class="pwi-barline"><b>Top ${n}</b><div class="pwi-track"><div class="pwi-fill" style="width:${Math.min(100,v)}%"></div></div><b>${Math.round(v)}%</b></div>`).join('')}</div>
@@ -1260,7 +1708,9 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       </div></div>
       <div class="pwi-warselect-scroll"><div class="pwi-warselect-list">${state.availableWars.map(w=>{
         const opp=opponentFromWarObject(w.rw,state.targetId);
-        return `<label class="pwi-warchoice"><input type="checkbox" data-war-id="${esc(w.id)}" ${selected.has(String(w.id))?'checked':''}><span class="pwi-warchoice-main"><b>${esc(fmtDate(w.end||w.start))}${opp.name?` • vs ${esc(opp.name)}`:''}</b><span>War #${esc(w.id)}${w.source==='news'?' • historical':''}</span></span></label>`;
+        const cachedTerm=loadTermGraph(w.id);
+        const termBadge=cachedTerm?.available ? `<span class="pwi-pill pwi-term-mini tone-${cachedTerm.tone}">${cachedTerm.likelihood}% ${cachedTerm.likelihood>=55?'TERM?':'COMP'}</span>` : '';
+        return `<label class="pwi-warchoice"><input type="checkbox" data-war-id="${esc(w.id)}" ${selected.has(String(w.id))?'checked':''}><span class="pwi-warchoice-main"><b>${esc(fmtDate(w.end||w.start))}${opp.name?` • vs ${esc(opp.name)}`:''}</b><span>War #${esc(w.id)}${w.source==='news'?' • historical':''}</span></span>${termBadge}</label>`;
       }).join('') || '<div class="pwi-muted">No completed wars found.</div>'}</div></div>
       <div class="pwi-warselect-footer"><button class="pwi-btn" data-ws="cancel">CANCEL</button><button class="pwi-btn" data-ws="apply">APPLY COMPARISON</button></div>
     </div>`;
@@ -1273,7 +1723,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     shade.querySelectorAll('[data-ws="cancel"]').forEach(b=>b.addEventListener('click',()=>shade.remove()));
     shade.querySelector('[data-ws="apply"]')?.addEventListener('click',()=>{
       saveSelectedWarIds(state.targetId,checks().filter(c=>c.checked).map(c=>String(c.dataset.warId)));
-      shade.remove(); state.reports=[]; buildAnalysisRows(); render(); analyzeHistory(false);
+      shade.remove(); state.loadedReports=[]; state.reports=[]; buildAnalysisRows(); render(); analyzeHistory(false);
     });
     shade.addEventListener('click',e=>{if(e.target===shade)shade.remove();});
     const onKey = e => { if (e.key === 'Escape') { shade.remove(); document.removeEventListener('keydown', onKey, true); } };
@@ -1290,6 +1740,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       <div class="pwi-tabs">${[['profile','WAR PROFILE'],['team','WAR TEAM'],['members','MEMBERS'],['watch','PRE-WAR WATCH'],['help','HOW TO READ']].map(([v,l])=>`<button class="pwi-tab ${state.view===v?'active':''}" data-view="${v}">${l}</button>`).join('')}</div>
       ${state.view==='members'?`<div class="pwi-toolbar"><input id="pwi-search" value="${esc(state.filter)}" placeholder="Search member / ID / role…"><select id="pwi-sort"><option value="activityScore"${state.sort==='activityScore'?' selected':''}>War activity</option><option value="participation"${state.sort==='participation'?' selected':''}>Participation %</option><option value="avg"${state.sort==='avg'?' selected':''}>Avg hits</option><option value="totalHits"${state.sort==='totalHits'?' selected':''}>Total hits</option><option value="recent"${state.sort==='recent'?' selected':''}>Last war hits</option><option value="live"${state.sort==='live'?' selected':''}>Current activity</option><option value="level"${state.sort==='level'?' selected':''}>Level</option></select></div>`:''}
       <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><button class="pwi-btn" data-act="wars" ${state.analyzing?'disabled':''}>SELECT WARS (${state.selectedWarIds.length})</button><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>RESCAN SELECTED</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
+      <div class="pwi-warfilter"><span>WAR TYPE:</span><button class="pwi-btn ${state.warTypeFilter==='all'?'active':''}" data-warfilter="all">ALL</button><button class="pwi-btn ${state.warTypeFilter==='competitive'?'active':''}" data-warfilter="competitive">COMPETITIVE-LIKE</button><button class="pwi-btn ${state.warTypeFilter==='term'?'active':''}" data-warfilter="term">TERM-LIKE</button></div>
       <div class="pwi-body">${body}</div></div>`;
   }
 
@@ -1380,7 +1831,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     const blob = new Blob([csv], {type:'text/csv;charset=utf-8'});
     const a = document.createElement('a');
     a.href = URL.createObjectURL(blob);
-    a.download = `wrath-war-intel-${state.scope}-${state.targetId || 'faction'}-${Date.now()}.csv`;
+    a.download = `wrath-war-intel-${state.scope}-${state.warTypeFilter}-${state.targetId || 'faction'}-${Date.now()}.csv`;
     a.click();
     setTimeout(()=>URL.revokeObjectURL(a.href),5000);
   }
@@ -1393,7 +1844,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       if (next === state.scope) return;
       state.scope = next;
       storageSet('prewarScope', state.scope);
-      state.target = null; state.targetId = 0; state.reports = []; state.rows = []; state.availableWars = []; state.selectedWarIds = []; state.watch = null;
+      state.target = null; state.targetId = 0; state.loadedReports = []; state.reports = []; state.rows = []; state.availableWars = []; state.selectedWarIds = []; state.warTypeFilter = 'all'; state.watch = null;
       state.error = ''; state.warning = ''; state.progress = ''; state.view = 'profile';
       render();
       scanBase({analyze:true,forceHistory:false});
@@ -1401,6 +1852,23 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     p.querySelectorAll('[data-view]').forEach(btn=>btn.addEventListener('click',()=>{state.view=btn.dataset.view||'profile';render();}));
     p.querySelector('[data-act="scan"]')?.addEventListener('click',()=>scanBase({analyze:true,forceHistory:false}));
     p.querySelector('[data-act="wars"]')?.addEventListener('click',openWarSelector);
+    p.querySelectorAll('[data-warfilter]').forEach(btn=>btn.addEventListener('click',()=>{
+      const next = btn.dataset.warfilter || 'all';
+      if (next === state.warTypeFilter) return;
+      saveWarTypeFilter(state.targetId, next);
+      applyWarTypeFilter();
+      buildAnalysisRows();
+      const t = termSummary();
+      if (next !== 'all' && !state.reports.length && state.loadedReports.length) {
+        state.warning = `No selected wars currently match the ${next==='term'?'TERM-LIKE':'COMPETITIVE-LIKE'} graph filter.`;
+      } else if (t.unknown && next !== 'all') {
+        state.warning = `${t.unknown} selected war graph${t.unknown===1?' is':'s are'} unclassified and excluded from filtered views.`;
+      } else {
+        state.warning = '';
+      }
+      state.progress = `${state.reports.length}/${state.loadedReports.length} wars • ${next==='term'?'TERM-LIKE':next==='competitive'?'COMPETITIVE-LIKE':'ALL'}`;
+      render();
+    }));
     p.querySelector('[data-act="history"]')?.addEventListener('click',()=>analyzeHistory(true));
     p.querySelector('[data-act="export"]')?.addEventListener('click',exportCsv);
     p.querySelector('[data-act="key"]')?.addEventListener('click',()=>{state.apiKey='';storageSet('apiKey','');render();});
