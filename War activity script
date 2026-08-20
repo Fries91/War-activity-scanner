@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.5.0
+// @version      3.5.1
 // @description  PDA-first war intelligence with exact war selection, faction/enemy comparison, stable Torn header spy icon, energy estimates, trends, and automatic script updates.
 // @author       Fries91
 // @match        https://www.torn.com/*
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.5.0';
-  const BUILD = 'EXACT-WAR-SELECTOR-STABLE-HEADER-20260820';
+  const VERSION = '3.5.1';
+  const BUILD = 'WAR-SELECTOR-PDA-EXIT-FIX-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -908,6 +908,13 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 .pwi-detail{margin-left:auto}.pwi-footnote{font-size:9px;color:#74867a;margin:3px 2px 10px}
 .pwi-shade{position:fixed;inset:0;z-index:1000001;background:#000c;display:flex;align-items:flex-start;justify-content:center;padding:max(8px,env(safe-area-inset-top,0px)) 7px max(8px,env(safe-area-inset-bottom,0px))}
 .pwi-modal{width:min(560px,100%);max-height:calc(100dvh - 16px);overflow:auto;-webkit-overflow-scrolling:touch;background:#131b16;border:1px solid #46574b;border-radius:11px;padding:11px;color:#fff}.pwi-modal h3{margin:0 0 8px;color:#82ff95}.pwi-modal table{width:100%;border-collapse:collapse;font-size:10px}.pwi-modal th,.pwi-modal td{padding:6px 4px;border-bottom:1px solid #29352d;text-align:left}.pwi-modal th{color:#93a89a}.pwi-actions{display:flex;gap:6px;justify-content:flex-end;flex-wrap:wrap;margin-top:10px}
+.pwi-warselect-modal{display:flex;flex-direction:column;width:min(560px,100%);height:min(92dvh,820px);max-height:calc(100dvh - 12px);overflow:hidden;padding:0}
+.pwi-warselect-head{flex:0 0 auto;display:flex;align-items:flex-start;gap:8px;padding:11px 11px 8px;border-bottom:1px solid #2f4035;background:#131b16}
+.pwi-warselect-headtxt{flex:1;min-width:0}.pwi-warselect-head h3{margin:0;color:#82ff95}.pwi-warselect-close{flex:0 0 auto;min-width:34px;height:34px;padding:0;font-size:16px}
+.pwi-warselect-tools{flex:0 0 auto;padding:7px 11px;border-bottom:1px solid #26352c;background:#101611}
+.pwi-warselect-scroll{flex:1 1 auto;min-height:0;overflow-y:auto;overflow-x:hidden;-webkit-overflow-scrolling:touch;overscroll-behavior:contain;padding:8px 11px 12px;touch-action:pan-y}
+.pwi-warselect-footer{flex:0 0 auto;display:flex;gap:7px;justify-content:flex-end;padding:9px 11px calc(9px + env(safe-area-inset-bottom,0px));border-top:1px solid #3a4b40;background:#131b16;box-shadow:0 -6px 14px #0008}
+.pwi-warselect-footer .pwi-btn{min-height:38px}.pwi-warselect-footer [data-ws="apply"]{background:#24452d;border-color:#64a674;color:#9dffad}
 
 .pwi-warselect-list{display:flex;flex-direction:column;gap:5px;margin-top:8px}
 .pwi-warchoice{display:flex;align-items:flex-start;gap:8px;background:#101611;border:1px solid #29372e;border-radius:8px;padding:7px;cursor:pointer}
@@ -1240,20 +1247,22 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     const selected = new Set((state.selectedWarIds.length ? state.selectedWarIds : loadSelectedWarIds(state.targetId)).map(String));
     const shade = document.createElement('div');
     shade.className = 'pwi-shade';
-    shade.innerHTML = `<div class="pwi-modal">
-      <h3>🕵️ SELECT WARS TO COMPARE</h3>
-      <div class="pwi-warselect-summary">Choose the exact completed ranked wars to use. Every profile, player average, participation %, trend, concentration and energy estimate recalculates from only the checked wars.</div>
-      <div class="pwi-actions" style="justify-content:flex-start">
+    shade.innerHTML = `<div class="pwi-modal pwi-warselect-modal">
+      <div class="pwi-warselect-head">
+        <div class="pwi-warselect-headtxt"><h3>🕵️ SELECT WARS TO COMPARE</h3><div class="pwi-warselect-summary">Choose the exact completed ranked wars to use. Every profile, player average, participation %, trend, concentration and energy estimate recalculates from only the checked wars.</div></div>
+        <button class="pwi-btn pwi-warselect-close" data-ws="cancel" aria-label="Close war selector">✕</button>
+      </div>
+      <div class="pwi-warselect-tools"><div class="pwi-actions" style="justify-content:flex-start;margin-top:0">
         <button class="pwi-btn" data-ws="all">SELECT ALL</button>
         <button class="pwi-btn" data-ws="none">CLEAR</button>
         <button class="pwi-btn" data-ws="five">NEWEST 5</button>
         <button class="pwi-btn" data-ws="ten">NEWEST 10</button>
-      </div>
-      <div class="pwi-warselect-list">${state.availableWars.map(w=>{
+      </div></div>
+      <div class="pwi-warselect-scroll"><div class="pwi-warselect-list">${state.availableWars.map(w=>{
         const opp=opponentFromWarObject(w.rw,state.targetId);
         return `<label class="pwi-warchoice"><input type="checkbox" data-war-id="${esc(w.id)}" ${selected.has(String(w.id))?'checked':''}><span class="pwi-warchoice-main"><b>${esc(fmtDate(w.end||w.start))}${opp.name?` • vs ${esc(opp.name)}`:''}</b><span>War #${esc(w.id)}${w.source==='news'?' • historical':''}</span></span></label>`;
-      }).join('') || '<div class="pwi-muted">No completed wars found.</div>'}</div>
-      <div class="pwi-actions"><button class="pwi-btn" data-ws="cancel">CANCEL</button><button class="pwi-btn" data-ws="apply">APPLY COMPARISON</button></div>
+      }).join('') || '<div class="pwi-muted">No completed wars found.</div>'}</div></div>
+      <div class="pwi-warselect-footer"><button class="pwi-btn" data-ws="cancel">CANCEL</button><button class="pwi-btn" data-ws="apply">APPLY COMPARISON</button></div>
     </div>`;
     document.body.appendChild(shade);
     const checks=()=>[...shade.querySelectorAll('[data-war-id]')];
@@ -1261,12 +1270,14 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     shade.querySelector('[data-ws="none"]')?.addEventListener('click',()=>checks().forEach(c=>c.checked=false));
     shade.querySelector('[data-ws="five"]')?.addEventListener('click',()=>checks().forEach((c,i)=>c.checked=i<5));
     shade.querySelector('[data-ws="ten"]')?.addEventListener('click',()=>checks().forEach((c,i)=>c.checked=i<10));
-    shade.querySelector('[data-ws="cancel"]')?.addEventListener('click',()=>shade.remove());
+    shade.querySelectorAll('[data-ws="cancel"]').forEach(b=>b.addEventListener('click',()=>shade.remove()));
     shade.querySelector('[data-ws="apply"]')?.addEventListener('click',()=>{
       saveSelectedWarIds(state.targetId,checks().filter(c=>c.checked).map(c=>String(c.dataset.warId)));
       shade.remove(); state.reports=[]; buildAnalysisRows(); render(); analyzeHistory(false);
     });
     shade.addEventListener('click',e=>{if(e.target===shade)shade.remove();});
+    const onKey = e => { if (e.key === 'Escape') { shade.remove(); document.removeEventListener('keydown', onKey, true); } };
+    document.addEventListener('keydown', onKey, true);
   }
 
   function panelHtml() {
