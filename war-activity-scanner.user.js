@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.6.1
+// @version      3.6.3
 // @description  Standalone PDA-first war intelligence with exact war selection, termed-war graph detection, faction/enemy comparison, energy estimates, trends, and automatic updates.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @icon         https://www.torn.com/favicon.ico
-// @updateURL    https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/War%20activity%20script
-// @downloadURL  https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/War%20activity%20script
+// @updateURL    https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/war-activity-scanner.user.js
+// @downloadURL  https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/war-activity-scanner.user.js
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.6.1';
-  const BUILD = 'TERM-GRAPH-REPORT-FALLBACK-20260820';
+  const VERSION = '3.6.3';
+  const BUILD = 'RENDERED-GRAPH-OVERRIDE-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -458,7 +458,7 @@
   function loadReportByWar(targetId, warId) { return storageGet(reportCacheKey(targetId, warId), null); }
   function saveReportByWar(targetId, warId, report) { storageSet(reportCacheKey(targetId, warId), report); }
 
-  const TERM_GRAPH_ALGO = 2;
+  const TERM_GRAPH_ALGO = 4;
 
   function warTypeFilterKey(targetId) { return `warTypeFilter:${targetId}`; }
   function loadWarTypeFilter(targetId) {
@@ -478,6 +478,43 @@
   }
   function saveTermGraph(warId, result) {
     storageSet(termGraphCacheKey(warId), { at: Date.now(), result });
+  }
+
+
+  function termOverrideKey(warId) { return `termOverride:${warId}`; }
+
+  function loadTermOverride(warId) {
+    const v = String(storageGet(termOverrideKey(warId), 'auto'));
+    return ['term','competitive'].includes(v) ? v : 'auto';
+  }
+
+  function saveTermOverride(warId, value) {
+    const v = ['term','competitive'].includes(value) ? value : 'auto';
+    if (v === 'auto') storageSet(termOverrideKey(warId), 'auto');
+    else storageSet(termOverrideKey(warId), v);
+    return v;
+  }
+
+  function applyTermOverride(report, autoResult) {
+    const override = loadTermOverride(report?.id);
+    if (override === 'term') {
+      return {
+        ...(autoResult || {}),
+        available:true, likelihood:100, label:'KNOWN TERMED • MANUAL', tone:'red',
+        source:'manual', confidence:'MANUAL', override:'term',
+        reasons:['Manually marked as a known termed war. Automatic graph/report result is bypassed until AUTO is selected.']
+      };
+    }
+    if (override === 'competitive') {
+      return {
+        ...(autoResult || {}),
+        available:true, likelihood:0, label:'KNOWN COMPETITIVE • MANUAL', tone:'green',
+        source:'manual', confidence:'MANUAL', override:'competitive',
+        reasons:['Manually marked as a known competitive war. Automatic graph/report result is bypassed until AUTO is selected.']
+      };
+    }
+    if (autoResult) autoResult.override = 'auto';
+    return autoResult;
   }
 
   function normalizeGraphTime(v) {
@@ -696,6 +733,159 @@
     return candidates[0] || {points:[],source:'none',score:-1};
   }
 
+
+  function extractGraphPointsFromObject(root) {
+    const candidates = [];
+    let visited = 0;
+
+    function add(points, source) {
+      const cleaned = cleanGraphPoints(points);
+      const score = graphCandidateScore(cleaned);
+      if (score >= 0) candidates.push({points:cleaned, source, score});
+    }
+
+    function rowToPoint(row) {
+      if (!row) return null;
+      if (Array.isArray(row) && row.length >= 3) {
+        return {t:row[0], a:row[1], b:row[2]};
+      }
+      if (typeof row !== 'object') return null;
+      const t = row.t ?? row.time ?? row.timestamp ?? row.x ?? row.date ?? row.ts;
+      const a = row.a ?? row.score1 ?? row.y1 ?? row.home ?? row.left ?? row.faction1 ?? row.score_a ?? row.first;
+      const b = row.b ?? row.score2 ?? row.y2 ?? row.away ?? row.right ?? row.faction2 ?? row.score_b ?? row.second;
+      if (t == null || a == null || b == null) return null;
+      return {t,a,b};
+    }
+
+    function walk(value, depth=0, path='root') {
+      if (visited++ > 30000 || depth > 9 || value == null) return;
+
+      if (Array.isArray(value)) {
+        if (value.length >= 6) {
+          const rows = value.map(rowToPoint).filter(Boolean);
+          if (rows.length >= 6) add(rows, `json:${path}`);
+        }
+        for (let i=0; i<Math.min(value.length, 300); i++) walk(value[i], depth+1, `${path}[${i}]`);
+        return;
+      }
+
+      if (typeof value !== 'object') return;
+
+      // Common chart layouts: {timestamps:[...], series:[{data:[...]},{data:[...]}]}
+      const times = value.timestamps || value.times || value.labels || value.x || value.time;
+      const series = value.series || value.datasets || value.lines;
+      if (Array.isArray(times) && Array.isArray(series) && series.length >= 2) {
+        const s1 = series[0]?.data || series[0]?.values || series[0];
+        const s2 = series[1]?.data || series[1]?.values || series[1];
+        if (Array.isArray(s1) && Array.isArray(s2)) {
+          const n = Math.min(times.length, s1.length, s2.length);
+          const pts = [];
+          for (let i=0;i<n;i++) {
+            const a = typeof s1[i] === 'object' ? (s1[i]?.y ?? s1[i]?.value ?? s1[i]?.score) : s1[i];
+            const b = typeof s2[i] === 'object' ? (s2[i]?.y ?? s2[i]?.value ?? s2[i]?.score) : s2[i];
+            const t = typeof times[i] === 'object' ? (times[i]?.x ?? times[i]?.time ?? times[i]?.timestamp) : times[i];
+            pts.push({t,a,b});
+          }
+          if (pts.length >= 6) add(pts, `json-series:${path}`);
+        }
+      }
+
+      for (const [k,v] of Object.entries(value)) {
+        if (typeof v === 'function') continue;
+        walk(v, depth+1, `${path}.${k}`);
+      }
+    }
+
+    try { walk(root); } catch (_) {}
+    candidates.sort((a,b)=>b.score-a.score);
+    return candidates[0] || {points:[], source:'none', score:-1};
+  }
+
+  async function renderedWarGraphAnalysis(warId) {
+    return new Promise((resolve) => {
+      const iframe = document.createElement('iframe');
+      let finished = false;
+      let timer = null;
+
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        clearTimeout(timer);
+        try { iframe.remove(); } catch (_) {}
+        resolve(result || {points:[],source:'rendered-none',score:-1});
+      };
+
+      iframe.setAttribute('aria-hidden', 'true');
+      iframe.style.cssText = 'position:fixed!important;left:-1200px!important;top:0!important;width:900px!important;height:700px!important;opacity:.01!important;pointer-events:none!important;z-index:-9999!important;border:0!important;';
+      iframe.src = `/war.php?step=rankreport&rankID=${encodeURIComponent(warId)}&wrathGraphScan=${Date.now()}`;
+
+      iframe.onload = async () => {
+        try {
+          // Let Torn's page JS finish building the historical graph.
+          for (let pass=0; pass<5; pass++) {
+            await sleep(pass === 0 ? 1200 : 700);
+            const doc = iframe.contentDocument;
+            if (!doc) continue;
+
+            const html = doc.documentElement?.outerHTML || '';
+            const fromHtml = extractGraphPointsFromHtml(html);
+            if (fromHtml.points?.length >= 6) return finish({...fromHtml, source:`rendered-${fromHtml.source}`});
+
+            // Some chart libraries leave useful data objects directly on DOM nodes.
+            const attrs = [];
+            for (const el of Array.from(doc.querySelectorAll('[data-series],[data-points],[data-chart],[data-graph],[data-score]')).slice(0,100)) {
+              for (const a of Array.from(el.attributes || [])) {
+                if (/series|points|chart|graph|score|data/i.test(a.name)) attrs.push(a.value);
+              }
+            }
+            for (const raw of attrs) {
+              try {
+                const obj = JSON.parse(raw);
+                const fromObj = extractGraphPointsFromObject(obj);
+                if (fromObj.points?.length >= 6) return finish({...fromObj, source:`rendered-${fromObj.source}`});
+              } catch (_) {}
+            }
+          }
+
+          // Inspect resources the rendered report requested. This often reveals the
+          // JSON/AJAX endpoint used by the graph even when the HTML itself has no points.
+          const win = iframe.contentWindow;
+          const urls = Array.from(win?.performance?.getEntriesByType?.('resource') || [])
+            .map(e => e?.name).filter(Boolean)
+            .filter(u => {
+              try {
+                const x = new URL(u, location.href);
+                if (x.origin !== location.origin) return false;
+                return /war|rank|report|graph|score|ajax/i.test(x.href);
+              } catch (_) { return false; }
+            })
+            .slice(0,24);
+
+          for (const u of urls) {
+            try {
+              const r = await fetch(u, {credentials:'include', cache:'no-store'});
+              if (!r.ok) continue;
+              const txt = await r.text();
+
+              const h = extractGraphPointsFromHtml(txt);
+              if (h.points?.length >= 6) return finish({...h, source:`resource-${h.source}`});
+
+              try {
+                const obj = JSON.parse(txt);
+                const j = extractGraphPointsFromObject(obj);
+                if (j.points?.length >= 6) return finish({...j, source:`resource-${j.source}`});
+              } catch (_) {}
+            } catch (_) {}
+          }
+        } catch (_) {}
+        finish({points:[], source:'rendered-none', score:-1});
+      };
+
+      timer = setTimeout(() => finish({points:[],source:'rendered-timeout',score:-1}), 9000);
+      (document.body || document.documentElement).appendChild(iframe);
+    });
+  }
+
   function classifyTermGraph(points, report) {
     const p = cleanGraphPoints(points);
     if (p.length < 6) return {
@@ -840,49 +1030,59 @@
     const hitsPerHour = durationHours > 0 ? totalHits/durationHours : 0;
     const hitsPerMemberHour = durationHours > 0 && (aCount+bCount)>0 ? totalHits/((aCount+bCount)*durationHours) : 0;
 
-    // This is intentionally a conservative fallback. It estimates whether the completed
-    // report LOOKS like a low-competition / arranged-style war; it cannot prove terms.
-    let likelihood = 38;
+    // REPORT ESTIMATE: intentionally biased toward flagging suspicious wars rather than
+    // declaring broad participation/balanced hit totals "competitive". Termed wars can
+    // still have both factions farming participation and rewards.
+    let likelihood = 42;
     const reasons = [];
 
-    if (loserRatio >= .18 && loserRatio <= .38) {
-      likelihood += 18; reasons.push(`Final score ratio (${Math.round(loserRatio*100)}%) sits in a common controlled-loss band.`);
-    } else if (loserRatio > .60) {
-      likelihood -= 19; reasons.push(`Close final score ratio (${Math.round(loserRatio*100)}%) looks more competitive.`);
+    if (loserRatio >= .15 && loserRatio <= .42) {
+      likelihood += 22; reasons.push(`Final loser/winner score ratio (${Math.round(loserRatio*100)}%) looks like a controlled losing cap.`);
+    } else if (loserRatio > .42 && loserRatio <= .62) {
+      likelihood += 10; reasons.push(`Mid-range losing score (${Math.round(loserRatio*100)}%) can fit capped/termed scoring.`);
     } else if (loserRatio < .10 && hiScore > 0) {
-      likelihood += 7; reasons.push('Extremely one-sided final score can indicate a roll-over or arranged loss.');
+      likelihood += 18; reasons.push('Extremely one-sided score is compatible with a rollover/stomp-style term.');
+    } else if (loserRatio >= .78) {
+      likelihood -= 16; reasons.push(`Very close final score (${Math.round(loserRatio*100)}%) is stronger competitive evidence.`);
     }
 
-    if (durationHours >= 10 && hitsPerMemberHour > 0 && hitsPerMemberHour < .12) {
-      likelihood += 17; reasons.push(`Low fighting density across ${durationHours.toFixed(1)}h.`);
-    } else if (durationHours >= 6 && hitsPerMemberHour > 0 && hitsPerMemberHour < .20) {
-      likelihood += 9; reasons.push('Relatively light hit density for the war duration.');
-    } else if (hitsPerMemberHour >= .45) {
-      likelihood -= 15; reasons.push('High hit density looks more like sustained competition.');
+    if (durationHours >= 16) {
+      likelihood += 13; reasons.push(`Long ${durationHours.toFixed(1)}h duration increases term suspicion.`);
+    } else if (durationHours >= 8) {
+      likelihood += 7; reasons.push(`War lasted ${durationHours.toFixed(1)}h without resolving quickly.`);
+    } else if (durationHours <= 2 && loserRatio >= .65) {
+      likelihood -= 10; reasons.push('Short, close war looks more like a hard push than passive terms.');
     }
 
-    if (aCount && bCount) {
-      if (bothParticipation < .35) {
-        likelihood += 16; reasons.push(`Only ${Math.round(bothParticipation*100)}% average roster participation.`);
-      } else if (bothParticipation >= .60) {
-        likelihood -= 13; reasons.push(`Broad roster participation (${Math.round(bothParticipation*100)}%) looks more competitive.`);
-      }
-      if (participationBalance < .45 && Math.max(aPart,bPart) >= .35) {
-        likelihood += 8; reasons.push('Participation is heavily one-sided.');
-      }
+    if (durationHours >= 6 && hitsPerMemberHour > 0 && hitsPerMemberHour < .14) {
+      likelihood += 17; reasons.push('Low fighting density for the number of members and war length.');
+    } else if (durationHours >= 6 && hitsPerMemberHour > 0 && hitsPerMemberHour < .24) {
+      likelihood += 9; reasons.push('Relatively light sustained fighting density.');
+    } else if (hitsPerMemberHour >= .70 && loserRatio >= .70) {
+      likelihood -= 10; reasons.push('Very high hit density plus a close score is strong competitive evidence.');
     }
 
-    if (totalHits > 0) {
-      if (hitBalance < .25) {
-        likelihood += 10; reasons.push('Hit production is extremely one-sided.');
-      } else if (hitBalance > .65) {
-        likelihood -= 8; reasons.push('Both factions produced a fairly similar number of attacks.');
-      }
+    if (aCount && bCount && bothParticipation < .35) {
+      likelihood += 15; reasons.push(`Only ${Math.round(bothParticipation*100)}% average roster participation.`);
+    }
+    if (aCount && bCount && participationBalance < .40 && Math.max(aPart,bPart) >= .35) {
+      likelihood += 9; reasons.push('Roster participation is heavily one-sided.');
     }
 
-    if (durationHours > 0 && durationHours < 1.5 && loserRatio > .45) {
-      likelihood -= 8; reasons.push('Short, close-scoring war is less consistent with a passive term pattern.');
+    if (totalHits > 0 && hitBalance < .22) {
+      likelihood += 12; reasons.push('Successful attack production is extremely one-sided.');
     }
+
+    // A stomp with meaningful participation on both sides can still be a deliberate
+    // rollover; don't let "lots of hits" automatically erase the signal.
+    if (loserRatio < .28 && bothParticipation >= .45 && totalHits >= 100) {
+      likelihood += 8; reasons.push('One-sided score despite meaningful participation resembles a controlled rollover.');
+    }
+
+    // Balanced hit totals / broad participation are informational, not automatic
+    // competitive deductions, because termed wars often farm participation on both sides.
+    if (hitBalance >= .65) reasons.push('Both factions produced similar successful-hit totals; this does not rule out terms.');
+    if (bothParticipation >= .60) reasons.push(`Broad roster participation (${Math.round(bothParticipation*100)}%) does not rule out terms.`);
 
     likelihood = Math.max(5, Math.min(95, Math.round(likelihood)));
     let label='LIKELY COMPETITIVE • REPORT EST.', tone='green';
@@ -897,7 +1097,7 @@
       source:'report-fallback',
       points:0,
       confidence:'ESTIMATE',
-      reasons: reasons.length ? reasons.slice(0,5) : ['Completed report did not show a strong term-like or competitive pattern.'],
+      reasons: reasons.length ? reasons.slice(0,6) : ['Completed report did not show a strong term-like or competitive pattern.'],
       features:{
         durationHours, loserRatio, hitBalance, hitsPerHour, hitsPerMemberHour,
         targetParticipation:aPart, otherParticipation:bPart, participationBalance,
@@ -909,35 +1109,83 @@
   async function fetchTermGraphAnalysis(report, force=false) {
     if (!force) {
       const cached = loadTermGraph(report.id);
-      if (cached) return cached;
+      if (cached) return applyTermOverride(report, cached);
     }
-    let result;
+
+    let autoResult = null;
+    let staticFailure = '';
+
     try {
       const url = `/war.php?step=rankreport&rankID=${encodeURIComponent(report.id)}`;
       const r = await fetch(url, { credentials:'include', cache:'no-store' });
       if (!r.ok) throw new Error(`War graph HTTP ${r.status}`);
       const html = await r.text();
       const extracted = extractGraphPointsFromHtml(html);
-      result = classifyTermGraph(extracted.points, report);
-      result.source = extracted.source;
-      if (!result.available) {
-        result = classifyTermFromReport(report);
-        result.reasons.unshift('Historical graph series was not readable in TornPDA; using completed-report fallback.');
+      if (extracted.points?.length >= 6) {
+        autoResult = classifyTermGraph(extracted.points, report);
+        autoResult.source = extracted.source;
+      } else {
+        staticFailure = 'Static report HTML had no readable graph series.';
       }
     } catch (e) {
-      result = classifyTermFromReport(report);
-      result.reasons.unshift(`Graph read unavailable (${e?.message || 'unknown error'}); using completed-report fallback.`);
+      staticFailure = e?.message || 'static graph read failed';
     }
-    saveTermGraph(report.id, result);
-    return result;
+
+    if (!autoResult?.available) {
+      try {
+        const rendered = await renderedWarGraphAnalysis(report.id);
+        if (rendered.points?.length >= 6) {
+          autoResult = classifyTermGraph(rendered.points, report);
+          autoResult.source = rendered.source;
+          autoResult.reasons.unshift('Graph was captured from a fully rendered hidden Torn report page.');
+        }
+      } catch (_) {}
+    }
+
+    if (!autoResult?.available) {
+      autoResult = classifyTermFromReport(report);
+      autoResult.reasons.unshift(`Historical graph could not be read${staticFailure ? ` (${staticFailure})` : ''}; using completed-report estimate.`);
+    }
+
+    saveTermGraph(report.id, autoResult);
+    return applyTermOverride(report, autoResult);
+  }
+
+  function guaranteedWarClassification(report) {
+    let auto = report?.termGraph;
+
+    // Strip a prior manual overlay so AUTO can restore the underlying automatic result.
+    if (auto?.source === 'manual') auto = loadTermGraph(report?.id);
+
+    if (!auto?.available || !Number.isFinite(Number(auto?.likelihood))) {
+      try {
+        auto = classifyTermFromReport(report || {});
+      } catch (_) {
+        auto = {
+          available:true, likelihood:50, label:'BORDERLINE • REPORT EST.',
+          tone:'yellow', source:'report-fallback', points:0, confidence:'LOW ESTIMATE',
+          reasons:['Graph/detail signals were limited; using a neutral report estimate.'],
+          features:{fallback:true}
+        };
+      }
+      try { saveTermGraph(report?.id, auto); } catch (_) {}
+    }
+
+    auto.available = true;
+    auto.likelihood = Math.max(0, Math.min(100, Math.round(Number(auto.likelihood) || 50)));
+
+    const resolved = applyTermOverride(report, auto);
+    report.termGraph = resolved;
+    return resolved;
   }
 
   function applyWarTypeFilter() {
     const all = state.loadedReports || [];
+    all.forEach(r => guaranteedWarClassification(r));
     if (state.warTypeFilter === 'term') {
-      state.reports = all.filter(r => r.termGraph?.available && num(r.termGraph.likelihood) >= 55);
+      state.reports = all.filter(r => num(guaranteedWarClassification(r).likelihood) >= 55);
     } else if (state.warTypeFilter === 'competitive') {
-      state.reports = all.filter(r => r.termGraph?.available && num(r.termGraph.likelihood) < 55);
+      state.reports = all.filter(r => num(guaranteedWarClassification(r).likelihood) < 55);
     } else {
       state.reports = all.slice();
     }
@@ -945,11 +1193,12 @@
 
   function termSummary() {
     const all = state.loadedReports || [];
-    const known = all.filter(r=>r.termGraph?.available);
-    const term = known.filter(r=>num(r.termGraph.likelihood)>=55);
-    const very = known.filter(r=>num(r.termGraph.likelihood)>=75);
-    const competitive = known.filter(r=>num(r.termGraph.likelihood)<55);
-    const unknown = all.length-known.length;
+    all.forEach(r => guaranteedWarClassification(r));
+    const known = all.slice();
+    const term = known.filter(r=>num(r.termGraph?.likelihood)>=55);
+    const very = known.filter(r=>num(r.termGraph?.likelihood)>=75);
+    const competitive = known.filter(r=>num(r.termGraph?.likelihood)<55);
+    const unknown = 0;
     return {
       all:all.length, known:known.length, term:term.length, very:very.length,
       competitive:competitive.length, unknown,
@@ -972,7 +1221,9 @@
       id: r.id, start: r.start, end: r.end, result: r.result,
       targetScore: r.targetScore, otherScore: r.otherScore,
       opponentId: r.opponentId, opponentName: r.opponentName,
-      members: r.members,
+      targetAttacks: r.targetAttacks, otherAttacks: r.otherAttacks,
+      targetMemberCount: r.targetMemberCount, otherMemberCount: r.otherMemberCount,
+      members: r.members, opponentMembers: r.opponentMembers,
     }));
   }
 
@@ -1206,6 +1457,7 @@
             render();
             report.termGraph = await fetchTermGraphAnalysis(report, force);
             if (!report.termGraph?.available) graphMissing++;
+            guaranteedWarClassification(report);
             reports.push(report);
           }
         } catch (e) { errors.push(e?.message || String(e)); }
@@ -1219,7 +1471,7 @@
       const notices = [];
       if (errors.length) notices.push(`${reports.length}/${wars.length} selected war reports loaded; ${errors.length} unavailable.`);
       if (graphMissing) notices.push(`${graphMissing} war classification${graphMissing===1?'':'s'} could not be completed.`);
-      if (state.warTypeFilter !== 'all' && !state.reports.length && reports.length) notices.push('No loaded wars match the current WAR TYPE filter.');
+      if (state.warTypeFilter !== 'all' && !state.reports.length && reports.length) notices.push('No selected wars fall into the current WAR TYPE bucket.');
       state.warning = notices.join(' ');
       const filterName = state.warTypeFilter === 'term' ? 'TERM-LIKE' : state.warTypeFilter === 'competitive' ? 'COMPETITIVE-LIKE' : 'ALL';
       state.progress = `${state.reports.length}/${reports.length} wars • ${filterName}`;
@@ -1457,7 +1709,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 .pwi-warchoice-main{flex:1;min-width:0}.pwi-warchoice-main b{display:block;font-size:10px;color:#fff}.pwi-warchoice-main span{display:block;font-size:9px;color:#91a397;margin-top:2px}
 .pwi-warselect-summary{font-size:10px;color:#b9c7bd;margin:5px 0}
 .pwi-warfilter{display:flex;gap:5px;align-items:center;padding:5px 7px;background:#0e1511;border-top:1px solid #1e2a22;border-bottom:1px solid #29372e;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.pwi-warfilter::-webkit-scrollbar{display:none}.pwi-warfilter>span{font-size:9px;font-weight:900;color:#8fa095;white-space:nowrap}.pwi-warfilter .pwi-btn.active{background:#263b2d;border-color:#659071;color:#9cffab}
-.pwi-termwar{background:#101611;border:1px solid #29382f;border-radius:8px;padding:7px;margin-top:6px}.pwi-termwar-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.pwi-termwar-name{font-size:10px;font-weight:900;color:#fff;flex:1;min-width:160px}.pwi-termwar-meta{font-size:9px;color:#9fb0a5;margin-top:4px;line-height:1.35}.pwi-term-reasons{font-size:9px;color:#b8c6bd;margin-top:4px}.pwi-warchoice .pwi-term-mini{margin-left:auto;flex:0 0 auto}
+.pwi-termwar{background:#101611;border:1px solid #29382f;border-radius:8px;padding:7px;margin-top:6px}.pwi-term-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.pwi-term-actions .pwi-btn{font-size:9px;padding:5px 7px;min-height:29px}.pwi-term-actions .pwi-btn.active{border-color:#79c98c!important;color:#9effae!important;background:#1e3526!important}.pwi-termwar-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.pwi-termwar-name{font-size:10px;font-weight:900;color:#fff;flex:1;min-width:160px}.pwi-termwar-meta{font-size:9px;color:#9fb0a5;margin-top:4px;line-height:1.35}.pwi-term-reasons{font-size:9px;color:#b8c6bd;margin-top:4px}.pwi-warchoice .pwi-term-mini{margin-left:auto;flex:0 0 auto}
 
 .pwi-keybox{padding:14px}.pwi-keybox input{width:100%;background:#090d0a;color:#fff;border:1px solid #44584a;border-radius:8px;padding:10px;margin:9px 0}.pwi-keynote{font-size:10px;color:#93a399;line-height:1.45}
 
@@ -1682,8 +1934,8 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
         <div class="pwi-helpitem"><b>WAR PARTICIPATION</b><span>Percent of analyzed wars in which that player made at least one attack, among reports where they were listed.</span></div>
         <div class="pwi-helpitem"><b>AVG HITS/WAR</b><span>Average attacks across wars where they were listed, including zero-hit appearances.</span></div>
         <div class="pwi-helpitem"><b>EST. MIN ENERGY/WAR</b><span>Average recorded ranked-war attacks × 25 energy. This is a minimum/gross estimate, not exact net energy. Failed offensive attempts or assists may not be represented by the report, while Revitalize can restore attack energy.</span></div>
-        <div class="pwi-helpitem"><b>TERM-LIKE %</b><span>Uses the historical war graph when TornPDA exposes it. If not, it falls back to the completed report (duration, final score ratio, both factions’ attack volume and participation). REPORT EST. is lower-confidence and is never proof that factions made an agreement.</span></div>
-        <div class="pwi-helpitem"><b>WAR TYPE FILTER</b><span>ALL uses every selected war. COMPETITIVE-LIKE uses classifications under 55%; TERM-LIKE uses 55%+. Graph reads are preferred, but completed-report estimates are included when TornPDA cannot expose historical graph points.</span></div>
+        <div class="pwi-helpitem"><b>TERM-LIKE %</b><span>First tries the historical graph, including a fully rendered hidden Torn report page so TornPDA has a better chance of exposing the real series. If that still fails it uses REPORT EST. You can MARK TERMED / MARK COMPETITIVE for wars you already know; AUTO restores automatic detection.</span></div>
+        <div class="pwi-helpitem"><b>WAR TYPE FILTER</b><span>ALL uses every selected war. COMPETITIVE-LIKE uses classifications under 55%; TERM-LIKE uses 55%+. Manual known-war labels override the automatic percentage. Graph reads are preferred. If TornPDA cannot expose historical graph points, every loaded war is automatically classified from the completed report so it cannot disappear from both filters.</span></div>
         <div class="pwi-helpitem"><b>ACTIVITY SCORE</b><span>Our 0–100 comparison score combining participation, attack volume, and recent activity. It is not a Torn battle stat.</span></div>
         <div class="pwi-helpitem"><b>RECENT FORM</b><span>Compares roughly the newest three known wars with older known wars. Heating Up means recent attack volume has materially increased.</span></div>
       </div></div>
@@ -1716,7 +1968,8 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       ${(state.loadedReports||[]).map(rep=>{
         const g=rep.termGraph||{available:false,label:'NO CLASSIFICATION',tone:'grey',reasons:['Graph not scanned yet.']};
         const pct=g.available?`${g.likelihood}%`:'—';
-        return `<div class="pwi-termwar"><div class="pwi-termwar-top"><div class="pwi-termwar-name">${esc(fmtDate(rep.end||rep.start))} • vs ${esc(rep.opponentName||'Opponent')} • #${esc(rep.id)}</div><span class="pwi-pill tone-${g.tone}">${pct} ${esc(g.label)}</span></div><div class="pwi-termwar-meta">${g.available?(g.source==='report-fallback'?`REPORT EST. • ${fmtNum(g.features?.durationHours||0,1)}h • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}% • hit balance ${Math.round((g.features?.hitBalance||0)*100)}%`:`${g.points||0} graph points • ${fmtNum(g.features?.durationHours||0,1)}h graph span • lead changes ${g.features?.leadChanges??'—'} • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}%`):`Classification unavailable (${esc(g.source||'none')}).`}</div><div class="pwi-term-reasons">${(g.reasons||[]).slice(0,3).map(x=>`• ${esc(x)}`).join('<br>')}</div></div>`;
+        const ov=loadTermOverride(rep.id); const sourceLabel=g.source==='manual'?'MANUAL':g.source==='report-fallback'?'REPORT EST.':g.source&&g.source!=='none'?'GRAPH':'AUTO';
+        return `<div class="pwi-termwar"><div class="pwi-termwar-top"><div class="pwi-termwar-name">${esc(fmtDate(rep.end||rep.start))} • vs ${esc(rep.opponentName||'Opponent')} • #${esc(rep.id)}</div><span class="pwi-pill tone-${g.tone}">${pct} ${esc(g.label)}</span></div><div class="pwi-termwar-meta">${sourceLabel} • ${g.source==='report-fallback'?`${fmtNum(g.features?.durationHours||0,1)}h • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}% • hit balance ${Math.round((g.features?.hitBalance||0)*100)}%`:g.source==='manual'?'Known-war override saved locally':`${g.points||0} graph points • ${fmtNum(g.features?.durationHours||0,1)}h graph span • lead changes ${g.features?.leadChanges??'—'} • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}%`}</div><div class="pwi-term-reasons">${(g.reasons||[]).slice(0,4).map(x=>`• ${esc(x)}`).join('<br>')}</div><div class="pwi-term-actions"><button class="pwi-btn ${ov==='term'?'active':''}" data-termoverride="term" data-war="${esc(rep.id)}">MARK TERMED</button><button class="pwi-btn ${ov==='competitive'?'active':''}" data-termoverride="competitive" data-war="${esc(rep.id)}">MARK COMPETITIVE</button><button class="pwi-btn ${ov==='auto'?'active':''}" data-termoverride="auto" data-war="${esc(rep.id)}">AUTO</button></div></div>`;
       }).join('')}
     </div>
 
@@ -1962,7 +2215,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       buildAnalysisRows();
       const t = termSummary();
       if (next !== 'all' && !state.reports.length && state.loadedReports.length) {
-        state.warning = `No selected wars currently match the ${next==='term'?'TERM-LIKE':'COMPETITIVE-LIKE'} graph filter.`;
+        state.warning = `None of the selected wars currently classify as ${next==='term'?'TERM-LIKE':'COMPETITIVE-LIKE'}. Switch to ALL to see each war’s percentage and source.`;
       } else if (t.unknown && next !== 'all') {
         state.warning = `${t.unknown} selected war classification${t.unknown===1?' is':'s are'} unavailable and excluded from filtered views.`;
       } else {
@@ -1977,6 +2230,19 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     p.querySelector('[data-act="savekey"]')?.addEventListener('click',()=>{const v=p.querySelector('#pwi-key')?.value?.trim();if(!v)return;state.apiKey=v;storageSet('apiKey',v);render();scanBase({analyze:true,forceHistory:true});});
     p.querySelector('#pwi-search')?.addEventListener('input',e=>{state.filter=e.target.value;render();const el=document.getElementById('pwi-search');if(el){el.focus();try{el.setSelectionRange(el.value.length,el.value.length)}catch(_){}}});
     p.querySelector('#pwi-sort')?.addEventListener('change',e=>{state.sort=e.target.value;render();});
+    p.querySelectorAll('[data-termoverride]').forEach(btn=>btn.addEventListener('click',()=>{
+      const warId=String(btn.dataset.war||''); if(!warId) return;
+      const value=saveTermOverride(warId, btn.dataset.termoverride||'auto');
+      const rep=(state.loadedReports||[]).find(r=>String(r.id)===warId);
+      if(rep){
+        let auto=loadTermGraph(warId);
+        if(!auto || auto.source==='manual') auto=classifyTermFromReport(rep);
+        rep.termGraph=applyTermOverride(rep, auto);
+      }
+      applyWarTypeFilter(); buildAnalysisRows();
+      state.warning = value==='auto' ? 'Automatic term detection restored for this war.' : `War #${warId} saved as ${value==='term'?'KNOWN TERMED':'KNOWN COMPETITIVE'}.`;
+      render();
+    }));
     p.querySelectorAll('[data-detail]').forEach(btn=>btn.addEventListener('click',()=>detailModal(btn.dataset.detail)));
   }
 
