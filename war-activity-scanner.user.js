@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.7.2
+// @version      3.7.3
 // @description  Standalone PDA-first war intelligence with hybrid termed-war detection using attack timestamps, participation patterns, graph/report evidence, faction/enemy comparison, and energy estimates.
 // @author       Fries91
 // @match        https://www.torn.com/*
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.7.2';
-  const BUILD = 'FAST-HYBRID-TERM-SCAN-20260820';
+  const VERSION = '3.7.3';
+  const BUILD = 'DIRECT-ICON-STRIP-MOUNT-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -2190,19 +2190,19 @@
     s.textContent = `
 #${UI}-header-slot{
 display:inline-flex!important;align-items:center!important;justify-content:center!important;
-width:25px!important;height:25px!important;min-width:25px!important;max-width:25px!important;
-margin:0 2px!important;padding:0!important;flex:0 0 auto!important;
-position:relative!important;z-index:2147483000!important;overflow:visible!important;
+width:28px!important;height:30px!important;min-width:28px!important;max-width:28px!important;
+margin:0 1px!important;padding:0!important;flex:0 0 28px!important;
+position:relative!important;z-index:2147483000!important;overflow:visible!important;vertical-align:middle!important;
 }
 #${UI}-btn{
 display:inline-flex!important;align-items:center!important;justify-content:center!important;
-width:25px!important;height:25px!important;min-width:25px!important;max-width:25px!important;
-margin:0!important;padding:0!important;border:0!important;border-radius:5px!important;
-background:rgba(10,16,12,.18)!important;color:#fff!important;font-size:17px!important;line-height:1!important;
+width:27px!important;height:29px!important;min-width:27px!important;max-width:27px!important;
+margin:0!important;padding:0!important;border:0!important;border-radius:4px!important;
+background:transparent!important;color:#fff!important;font-size:19px!important;line-height:1!important;
+font-family:Arial,"Noto Color Emoji","Apple Color Emoji","Segoe UI Emoji",sans-serif!important;
 font-weight:400!important;box-shadow:none!important;cursor:pointer!important;user-select:none!important;
-position:relative!important;left:auto!important;right:auto!important;top:auto!important;bottom:auto!important;
-z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!important;
--webkit-appearance:none!important;appearance:none!important;transform:none!important;opacity:1!important;
+position:relative!important;z-index:2147483001!important;vertical-align:middle!important;flex:0 0 27px!important;
+-webkit-appearance:none!important;appearance:none!important;transform:none!important;opacity:1!important;visibility:visible!important;
 }
 #${UI}-btn:hover{filter:drop-shadow(0 1px 2px rgba(0,0,0,.75))}
 #${UI}-header-slot.pwi-header-hidden{display:none!important}
@@ -2285,19 +2285,22 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
     }
 
     if (!b) {
-      b = document.createElement('button');
+      b = document.createElement('span');
       b.id = `${UI}-btn`;
-      b.type = 'button';
       b.textContent = '🕵️';
       b.title = 'WRATH War Intelligence';
+      b.setAttribute('role', 'button');
+      b.setAttribute('tabindex', '0');
       b.setAttribute('aria-label', 'Open WRATH War Intelligence');
-      b.addEventListener('click', (e) => {
+      const activate = (e) => {
         e.preventDefault();
         e.stopPropagation();
         state.open = !state.open;
         render();
         if (state.open && state.apiKey) scanBase({ analyze: true, forceHistory: false });
-      });
+      };
+      b.addEventListener('click', activate);
+      b.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') activate(e); });
     }
 
     if (b.parentElement !== slot) slot.appendChild(b);
@@ -2407,6 +2410,109 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
     return candidates[0]?.el || null;
   }
 
+  function directVisibleChildren(row) {
+    return Array.from(row?.children || []).filter(ch => {
+      if (!ch || ch.id === `${UI}-header-slot`) return false;
+      const r = visibleRect(ch);
+      return !!r && r.width >= 8 && r.height >= 8;
+    });
+  }
+
+  function elementHasVisualIcon(el) {
+    try {
+      if (el.querySelector?.('img,svg,i,[class*="icon"],[class*="sprite"]')) return true;
+      const cs = getComputedStyle(el);
+      if (cs.backgroundImage && cs.backgroundImage !== 'none') return true;
+      for (const ch of Array.from(el.children || []).slice(0,6)) {
+        const s = getComputedStyle(ch);
+        if (s.backgroundImage && s.backgroundImage !== 'none') return true;
+      }
+    } catch (_) {}
+    return false;
+  }
+
+  function findCompactTornIconStrip() {
+    const maxTop = Math.min(Math.max(760, innerHeight * .70), 980);
+    const candidates = [];
+    const rows = Array.from(document.querySelectorAll('div,ul,ol,nav,section'));
+
+    for (const row of rows) {
+      if (!row || row.id === `${UI}-header-slot` || row.closest?.(`#${UI}-panel`)) continue;
+      const rr = visibleRect(row);
+      if (!rr || rr.top < 120 || rr.top > maxTop) continue;
+      if (rr.width < innerWidth * .72 || rr.height < 28 || rr.height > 74) continue;
+
+      const kids = directVisibleChildren(row);
+      if (kids.length < 7 || kids.length > 22) continue;
+
+      const texts = kids.map(k => String(k.innerText || k.textContent || '').replace(/\s+/g,' ').trim());
+      const compact = texts.filter(t => t.length <= 4).length;
+      const iconish = kids.filter(elementHasVisualIcon).length;
+      const longLabels = texts.filter(t => t.length >= 7).length;
+      const navWords = /MESSAGES|EVENTS|AWARDS|HOME|ITEMS|CITY|WHEEL|STOCKS/i.test(texts.join(' '));
+
+      const widths = kids.map(k => visibleRect(k)?.width || 0).filter(Boolean);
+      const avgWidth = widths.length ? widths.reduce((a,b)=>a+b,0)/widths.length : 999;
+      const compactRatio = compact / kids.length;
+      const iconRatio = iconish / kids.length;
+
+      let score = kids.length * 4 + compactRatio * 120 + iconRatio * 90;
+      if (avgWidth >= 18 && avgWidth <= 70) score += 35;
+      if (rr.height >= 32 && rr.height <= 58) score += 30;
+      if (longLabels <= 2) score += 35;
+      if (navWords) score -= 130;
+
+      // The Torn status/icon strip is usually below the main nav and resource bars.
+      if (rr.top >= 300) score += 20;
+
+      if (score >= 120) candidates.push({row,kids,score,rr});
+    }
+
+    candidates.sort((a,b)=>b.score-a.score);
+    return candidates[0] || null;
+  }
+
+  function blueStrength(rgb) {
+    const m = String(rgb || '').match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/i);
+    if (!m) return 0;
+    const r=+m[1], g=+m[2], b=+m[3];
+    return b - Math.max(r,g) + (b > 120 ? 25 : 0);
+  }
+
+  function findGenderLikeChild(strip) {
+    const kids = strip?.kids || directVisibleChildren(strip?.row);
+    if (!kids?.length) return null;
+
+    // First try real semantic/class data.
+    for (const k of kids) {
+      const hay = headerCandidateText(k);
+      const txt = String(k.textContent || '').trim();
+      if (txt.includes('♂') || txt.includes('♀') || /\bgender\b|\bmale\b|\bfemale\b/.test(hay)) return k;
+    }
+
+    // Torn's gender icon in the compact strip is blue on the user's layout.
+    // Inspect the first third only so the blue star/other icons later in the strip
+    // are less likely to be chosen.
+    const first = kids.slice(0, Math.max(3, Math.ceil(kids.length * .34)));
+    let best = null, bestScore = -999;
+    for (let i=0;i<first.length;i++) {
+      const k = first[i];
+      let score = -i * 2;
+      try {
+        score += blueStrength(getComputedStyle(k).color);
+        for (const d of Array.from(k.querySelectorAll?.('*') || []).slice(0,12)) {
+          score = Math.max(score, blueStrength(getComputedStyle(d).color) - i*2);
+        }
+      } catch (_) {}
+      if (score > bestScore) { bestScore=score; best=k; }
+    }
+    if (best && bestScore >= 20) return best;
+
+    // Last deterministic fallback for the exact compact status strip: in the
+    // classic Torn/PDA layout the gender entry is the second visible item.
+    return kids[Math.min(1, kids.length-1)] || kids[0] || null;
+  }
+
   function findTornHeaderResourceRow() {
     const maxTop = headerSearchBottom();
     const rows = Array.from(document.querySelectorAll(
@@ -2472,6 +2578,18 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
     if (gender && mountSlotAfter(gender, slot)) {
       lastHeaderMountAt = Date.now();
       return true;
+    }
+
+    // Direct fallback for the exact compact Torn status/icon strip visible in
+    // TornPDA. This does not depend on Torn exposing a readable gender class.
+    const strip = findCompactTornIconStrip();
+    if (strip?.row) {
+      const stripGender = findGenderLikeChild(strip);
+      if (stripGender && mountSlotAfter(stripGender, slot)) {
+        slot.dataset.mount = 'compact-strip';
+        lastHeaderMountAt = Date.now();
+        return true;
+      }
     }
 
     const row = findTornHeaderResourceRow();
@@ -2917,9 +3035,13 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
     // moment our userscript can see it. A light recovery check prevents a lost icon.
     setInterval(() => {
       const slot = document.getElementById(`${UI}-header-slot`);
-      const healthy = slot?.isConnected && !slot.classList.contains('pwi-header-hidden') &&
+      let healthy = slot?.isConnected && !slot.classList.contains('pwi-header-hidden') &&
         lockedHeaderParent?.isConnected && slot.parentElement === lockedHeaderParent;
-      if (!healthy) ensureUi(false);
+      if (healthy) {
+        const r = slot.getBoundingClientRect?.();
+        healthy = !!r && r.width >= 12 && r.height >= 12 && r.bottom > 0 && r.top < innerHeight;
+      }
+      if (!healthy) ensureUi(true);
     }, 2500);
   }
 
