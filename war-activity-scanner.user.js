@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.7.1
+// @version      3.7.2
 // @description  Standalone PDA-first war intelligence with hybrid termed-war detection using attack timestamps, participation patterns, graph/report evidence, faction/enemy comparison, and energy estimates.
 // @author       Fries91
 // @match        https://www.torn.com/*
@@ -24,12 +24,16 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.7.1';
-  const BUILD = 'PERSISTENT-SPY-HEADER-20260820';
+  const VERSION = '3.7.2';
+  const BUILD = 'FAST-HYBRID-TERM-SCAN-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
   const HISTORY_CACHE_MS = 30 * 60_000;
+  const FAST_GRAPH_FALLBACK_DELAY_MS = 2500;
+  const FAST_TIMELINE_PAGE_LIMIT = 35;
+  const FAST_TIMELINE_ATTACK_LIMIT = 3500;
+  const FAST_TIMELINE_SAMPLE_WINDOWS = 8;
 
   const state = {
     open: false,
@@ -164,6 +168,11 @@
   function apiV2(path) {
     const sep = path.includes('?') ? '&' : '?';
     return requestJson(`${API}/v2${path}${sep}key=${encodeURIComponent(state.apiKey)}`);
+  }
+
+  function setProgress(msg) {
+    state.progress = msg || '';
+    if (state.open) render();
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -458,8 +467,8 @@
   function loadReportByWar(targetId, warId) { return storageGet(reportCacheKey(targetId, warId), null); }
   function saveReportByWar(targetId, warId, report) { storageSet(reportCacheKey(targetId, warId), report); }
 
-  const TERM_GRAPH_ALGO = 5;
-  const TERM_TIMELINE_ALGO = 1;
+  const TERM_GRAPH_ALGO = 6;
+  const TERM_TIMELINE_ALGO = 2;
 
   function warTypeFilterKey(targetId) { return `warTypeFilter:${targetId}`; }
   function loadWarTypeFilter(targetId) {
@@ -555,12 +564,13 @@
     };
   }
 
-  async function fetchOwnFactionWarTimeline(report, force=false) {
+  async function fetchOwnFactionWarTimeline(report, force=false, progressCtx=null) {
     const cached = !force ? loadTermTimeline(report?.id) : null;
-    if (cached) return cached;
+    if (cached) {
+      if (progressCtx) setProgress(`${progressCtx} • timestamps cached`);
+      return cached;
+    }
 
-    // Detailed faction attack history is only available for the API key owner's faction.
-    // Enemy mode can use it only when the selected historical opponent is actually our faction.
     const involvesOwnFaction = num(state.ownId) &&
       (num(state.targetId) === num(state.ownId) || num(report?.opponentId) === num(state.ownId));
 
@@ -572,29 +582,50 @@
 
     const fromStart = Math.max(0, num(report.start) - 15);
     const toEnd = num(report.end) + 30;
-    let cursor = fromStart;
     const raw = [];
-    let pages = 0;
     let permissionError = '';
+    let pages = 0;
+    let sampled = false;
 
     try {
-      while (cursor <= toEnd && pages < 35 && raw.length < 3500) {
-        pages++;
-        const data = await apiV2(`/faction/attacks?from=${cursor}&to=${toEnd}&limit=100&sort=ASC`);
-        const rows = attackRows(data);
-        if (!rows.length) break;
+      if (!force) {
+        // FAST SCAN: sample the entire war evenly instead of paging every single
+        // attack. This keeps early/mid/late activity represented with a small,
+        // predictable number of API calls.
+        sampled = true;
+        const span = Math.max(1, toEnd - fromStart);
+        const windows = Math.max(4, FAST_TIMELINE_SAMPLE_WINDOWS);
+        for (let i = 0; i < windows; i++) {
+          const a = Math.floor(fromStart + span * (i / windows));
+          const b = Math.floor(fromStart + span * ((i + 1) / windows));
+          pages++;
+          if (progressCtx) setProgress(`${progressCtx} • timestamp sample ${i + 1}/${windows} • ${raw.length} attacks`);
+          const data = await apiV2(`/faction/attacks?from=${a}&to=${b}&limit=100&sort=ASC`);
+          const rows = attackRows(data);
+          raw.push(...rows);
+          await sleep(45);
+        }
+      } else {
+        // FORCE RESCAN: exhaustive pagination for the most complete possible
+        // timeline. Slower, but useful when validating a known war.
+        let cursor = fromStart;
+        while (cursor <= toEnd && pages < FAST_TIMELINE_PAGE_LIMIT && raw.length < FAST_TIMELINE_ATTACK_LIMIT) {
+          pages++;
+          if (progressCtx) setProgress(`${progressCtx} • full timestamps page ${pages} • ${raw.length} attacks`);
+          const data = await apiV2(`/faction/attacks?from=${cursor}&to=${toEnd}&limit=100&sort=ASC`);
+          const rows = attackRows(data);
+          if (!rows.length) break;
 
-        raw.push(...rows);
-        const times = rows.map(attackTimestamp).filter(Boolean);
-        const maxT = times.length ? Math.max(...times) : 0;
-        if (!maxT || rows.length < 100 || maxT >= toEnd) break;
+          raw.push(...rows);
+          const times = rows.map(attackTimestamp).filter(Boolean);
+          const maxT = times.length ? Math.max(...times) : 0;
+          if (!maxT || rows.length < 100 || maxT >= toEnd) break;
 
-        // Torn's time filters are based on attack timestamps. Move one second past
-        // the last returned timestamp to page through long wars.
-        const next = maxT + 1;
-        if (next <= cursor) break;
-        cursor = next;
-        await sleep(110);
+          const next = maxT + 1;
+          if (next <= cursor) break;
+          cursor = next;
+          await sleep(65);
+        }
       }
     } catch (e) {
       permissionError = e?.message || String(e);
@@ -631,6 +662,10 @@
     }
 
     const result = analyzeAttackTimeline(events, report);
+    result.pages = pages;
+    result.sampled = sampled;
+    result.sampleWindows = sampled ? FAST_TIMELINE_SAMPLE_WINDOWS : 0;
+    result.truncated = sampled || (!sampled && (pages >= FAST_TIMELINE_PAGE_LIMIT || raw.length >= FAST_TIMELINE_ATTACK_LIMIT));
     saveTermTimeline(report.id, result);
     return result;
   }
@@ -777,6 +812,9 @@
     let likelihood = 35;
     const reasons=[];
     const strong = t.bothSides;
+    const sampled = !!t.sampled;
+
+    if (sampled) reasons.push(`Fast Scan sampled ${t.sampleWindows || FAST_TIMELINE_SAMPLE_WINDOWS} time windows across the war; use FORCE RESCAN for a full timestamp timeline.`);
 
     if (strong) {
       if (t.overlapRatio >= .48) {
@@ -804,22 +842,24 @@
       reasons.push('Only one side of the detailed attack timeline was visible, so timestamp confidence is reduced.');
     }
 
-    if (t.maxGapSeconds >= 90*60) {
-      likelihood += 18; reasons.push(`Longest no-hit gap is ${(t.maxGapSeconds/3600).toFixed(1)}h.`);
-    } else if (t.maxGapSeconds >= 45*60 && t.durationHours >= 4) {
-      likelihood += 10; reasons.push(`Longest no-hit gap is ${Math.round(t.maxGapSeconds/60)}m.`);
-    }
+    if (!sampled) {
+      if (t.maxGapSeconds >= 90*60) {
+        likelihood += 18; reasons.push(`Longest no-hit gap is ${(t.maxGapSeconds/3600).toFixed(1)}h.`);
+      } else if (t.maxGapSeconds >= 45*60 && t.durationHours >= 4) {
+        likelihood += 10; reasons.push(`Longest no-hit gap is ${Math.round(t.maxGapSeconds/60)}m.`);
+      }
 
-    if (t.quietRatio >= .25) {
-      likelihood += 15; reasons.push(`${Math.round(t.quietRatio*100)}% of war time is extended quiet time beyond 30-minute gaps.`);
-    } else if (t.quietRatio >= .12) {
-      likelihood += 7; reasons.push(`${Math.round(t.quietRatio*100)}% of war time is extended quiet time.`);
+      if (t.quietRatio >= .25) {
+        likelihood += 15; reasons.push(`${Math.round(t.quietRatio*100)}% of war time is extended quiet time beyond 30-minute gaps.`);
+      } else if (t.quietRatio >= .12) {
+        likelihood += 7; reasons.push(`${Math.round(t.quietRatio*100)}% of war time is extended quiet time.`);
+      }
     }
 
     if (t.loserStoppedBeforeEnd >= 45*60 && t.finalWinnerShare >= .80) {
-      likelihood += 20; reasons.push(`Losing side stopped ${Math.round(t.loserStoppedBeforeEnd/60)}m before the end while the winner controlled ${Math.round(t.finalWinnerShare*100)}% of the final phase.`);
+      likelihood += sampled ? 10 : 20; reasons.push(`Losing side stopped ${Math.round(t.loserStoppedBeforeEnd/60)}m before the end while the winner controlled ${Math.round(t.finalWinnerShare*100)}% of the final phase${sampled?' in the sampled timeline':''}.`);
     } else if (t.loserStoppedBeforeEnd >= 20*60 && t.finalWinnerShare >= .85) {
-      likelihood += 11; reasons.push('The losing side stops early and the winner performs most late-war attacks.');
+      likelihood += sampled ? 6 : 11; reasons.push(`The losing side stops early and the winner performs most late-war attacks${sampled?' in the sampled timeline':''}.`);
     }
 
     if (t.capShare >= .45 && Math.max(t.aCap?.modeHits||0,t.bCap?.modeHits||0) <= 12) {
@@ -838,7 +878,7 @@
     return {
       available:true,
       likelihood,
-      confidence: strong && t.events>=40 ? 'HIGH' : t.events>=15 ? 'MEDIUM' : 'LOW',
+      confidence: sampled ? (strong && t.events>=30 ? 'MEDIUM' : 'LOW') : (strong && t.events>=40 ? 'HIGH' : t.events>=15 ? 'MEDIUM' : 'LOW'),
       reasons:reasons.slice(0,8),
       features:t
     };
@@ -1244,7 +1284,7 @@
         finish({points:[], source:'rendered-none', score:-1});
       };
 
-      timer = setTimeout(() => finish({points:[],source:'rendered-timeout',score:-1}), 9000);
+      timer = setTimeout(() => finish({points:[],source:'rendered-timeout',score:-1}), FAST_GRAPH_FALLBACK_DELAY_MS);
       (document.body || document.documentElement).appendChild(iframe);
     });
   }
@@ -1470,6 +1510,23 @@
   }
 
 
+  function timelineStrongEnoughToSkipGraph(timelineEvidence) {
+    if (!timelineEvidence?.available) return false;
+    const t = timelineEvidence.features || {};
+    const sampled = !!t.sampled;
+    const enoughEvents = num(t.events) >= (sampled ? 30 : 20);
+    const clearHigh = num(timelineEvidence.likelihood) >= (sampled ? 80 : 70);
+    const clearLow = num(timelineEvidence.likelihood) <= (sampled ? 20 : 30);
+    const decentCoverage = t.bothSides || num(t.events) >= (sampled ? 70 : 50);
+    return enoughEvents && decentCoverage && (clearHigh || clearLow);
+  }
+
+  function reportStrongEnoughToSkipGraph(reportEstimate) {
+    if (!reportEstimate?.available) return false;
+    const p = num(reportEstimate.likelihood, 50);
+    return p >= 80 || p <= 20;
+  }
+
   function combineTermEvidence(report, graphOrReport, timelineEvidence) {
     const base = graphOrReport || classifyTermFromReport(report);
     const tl = timelineEvidence;
@@ -1482,12 +1539,17 @@
     if (tl?.available) {
       // Exact timestamps are the strongest evidence. Weight them more heavily when
       // both factions appear in the detailed faction attack history.
-      const timelineWeight = tl.features?.bothSides ? .68 : .45;
+      const sampled = !!tl.features?.sampled;
+      const timelineWeight = sampled
+        ? (tl.features?.bothSides ? .50 : .35)
+        : (tl.features?.bothSides ? .68 : .45);
       likelihood = Math.round(num(tl.likelihood,50)*timelineWeight + num(base?.likelihood,50)*(1-timelineWeight));
       source = source==='report-fallback' ? 'timeline+report' : 'timeline+graph';
-      confidence = tl.confidence === 'HIGH' && source==='timeline+graph' ? 'VERY HIGH' :
-                   tl.confidence === 'HIGH' ? 'HIGH' :
-                   tl.confidence === 'MEDIUM' ? 'MEDIUM' : 'LOW';
+      confidence = sampled
+        ? (tl.confidence === 'MEDIUM' ? 'MEDIUM' : 'LOW')
+        : (tl.confidence === 'HIGH' && source==='timeline+graph' ? 'VERY HIGH' :
+           tl.confidence === 'HIGH' ? 'HIGH' :
+           tl.confidence === 'MEDIUM' ? 'MEDIUM' : 'LOW');
       reasons.push(...(tl.reasons||[]).slice(0,5));
       reasons.push(...(base?.reasons||[]).slice(0,3));
     } else {
@@ -1523,37 +1585,72 @@
     };
   }
 
-  async function fetchTermGraphAnalysis(report, force=false) {
-    const override = loadTermOverride(report?.id);
-
-    let autoResult = null;
+  async function fetchTermGraphAnalysis(report, force=false, progressCtx=null) {
     if (!force) {
       const cached = loadTermGraph(report.id);
-      if (cached && cached.source !== 'manual') autoResult = cached;
+      if (cached && cached.source !== 'manual') {
+        if (progressCtx) setProgress(`${progressCtx} • classification cached`);
+        return applyTermOverride(report, cached);
+      }
     }
 
+    // FAST PATH 1: detailed attack timestamps first.
+    const timeline = await fetchOwnFactionWarTimeline(report, force, progressCtx);
+    const timelineEvidence = classifyTimelineEvidence(timeline, report);
+
+    // FAST PATH 2: completed report estimate is instant and gives context.
+    const reportBase = classifyTermFromReport(report);
+
+    // If timestamps are decisive, skip all graph work.
+    if (timelineStrongEnoughToSkipGraph(timelineEvidence)) {
+      if (progressCtx) setProgress(`${progressCtx} • timestamp result`);
+      const autoResult = combineTermEvidence(report, reportBase, timelineEvidence);
+      autoResult.fastPath = 'timestamps';
+      saveTermGraph(report.id, autoResult);
+      return applyTermOverride(report, autoResult);
+    }
+
+    // If timestamps are unavailable but the completed report is already decisive,
+    // use it immediately instead of opening the slow hidden report page.
+    if (!timelineEvidence?.available && reportStrongEnoughToSkipGraph(reportBase)) {
+      if (progressCtx) setProgress(`${progressCtx} • report result`);
+      const autoResult = combineTermEvidence(report, reportBase, timelineEvidence);
+      autoResult.fastPath = 'report';
+      saveTermGraph(report.id, autoResult);
+      return applyTermOverride(report, autoResult);
+    }
+
+    // AMBIGUOUS ONLY: cheap static graph read.
     let graphBase = null;
     let staticFailure = '';
+    if (progressCtx) setProgress(`${progressCtx} • checking graph`);
 
-    if (!autoResult || force) {
-      try {
-        const url = `/war.php?step=rankreport&rankID=${encodeURIComponent(report.id)}`;
-        const r = await fetch(url, { credentials:'include', cache:'no-store' });
-        if (!r.ok) throw new Error(`War graph HTTP ${r.status}`);
-        const html = await r.text();
-        const extracted = extractGraphPointsFromHtml(html);
-        if (extracted.points?.length >= 6) {
-          graphBase = classifyTermGraph(extracted.points, report);
-          graphBase.source = extracted.source;
-          graphBase.confidence = 'GRAPH';
-        } else {
-          staticFailure = 'Static report HTML had no readable graph series.';
-        }
-      } catch (e) {
-        staticFailure = e?.message || 'static graph read failed';
+    try {
+      const url = `/war.php?step=rankreport&rankID=${encodeURIComponent(report.id)}`;
+      const r = await fetch(url, { credentials:'include', cache:'no-store' });
+      if (!r.ok) throw new Error(`War graph HTTP ${r.status}`);
+      const html = await r.text();
+      const extracted = extractGraphPointsFromHtml(html);
+      if (extracted.points?.length >= 6) {
+        graphBase = classifyTermGraph(extracted.points, report);
+        graphBase.source = extracted.source;
+        graphBase.confidence = 'GRAPH';
+      } else {
+        staticFailure = 'Static report HTML had no readable graph series.';
       }
+    } catch (e) {
+      staticFailure = e?.message || 'static graph read failed';
+    }
 
-      if (!graphBase?.available) {
+    // Deep graph rendering is now last resort only.
+    if (!graphBase?.available) {
+      const ambiguous = (
+        (timelineEvidence?.available && num(timelineEvidence.likelihood) > 30 && num(timelineEvidence.likelihood) < 70) ||
+        (!timelineEvidence?.available && num(reportBase.likelihood) > 20 && num(reportBase.likelihood) < 80)
+      );
+
+      if (ambiguous) {
+        if (progressCtx) setProgress(`${progressCtx} • deep graph check`);
         try {
           const rendered = await renderedWarGraphAnalysis(report.id);
           if (rendered.points?.length >= 6) {
@@ -1564,19 +1661,16 @@
           }
         } catch (_) {}
       }
-
-      if (!graphBase?.available) {
-        graphBase = classifyTermFromReport(report);
-        graphBase.reasons.unshift(`Historical graph unavailable${staticFailure?` (${staticFailure})`:''}; report evidence used.`);
-      }
-
-      const timeline = await fetchOwnFactionWarTimeline(report, force);
-      const timelineEvidence = classifyTimelineEvidence(timeline, report);
-      autoResult = combineTermEvidence(report, graphBase, timelineEvidence);
-
-      saveTermGraph(report.id, autoResult);
     }
 
+    if (!graphBase?.available) {
+      graphBase = reportBase;
+      graphBase.reasons.unshift(`Graph not needed/readable${staticFailure?` (${staticFailure})`:''}; using fast report evidence.`);
+    }
+
+    const autoResult = combineTermEvidence(report, graphBase, timelineEvidence);
+    autoResult.fastPath = graphBase === reportBase ? 'timeline+report' : 'timeline+graph';
+    saveTermGraph(report.id, autoResult);
     return applyTermOverride(report, autoResult);
   }
 
@@ -1874,8 +1968,7 @@
       const errors = [];
       let graphMissing = 0;
       for (let i = 0; i < wars.length; i++) {
-        state.progress = `Reading selected war ${i + 1} / ${wars.length}`;
-        render();
+        setProgress(`War ${i + 1}/${wars.length} • preparing`);
         try {
           let report = !force ? loadReportByWar(state.targetId, wars[i].id) : null;
           if (!report) {
@@ -1883,15 +1976,14 @@
             if (report) saveReportByWar(state.targetId, wars[i].id, report);
           }
           if (report) {
-            state.progress = `War ${i + 1}/${wars.length} • reading graph pattern`;
-            render();
-            report.termGraph = await fetchTermGraphAnalysis(report, force);
+            setProgress(`War ${i + 1}/${wars.length} • fast hybrid scan`);
+            report.termGraph = await fetchTermGraphAnalysis(report, force, `War ${i + 1}/${wars.length}`);
             if (!report.termGraph?.available) graphMissing++;
             guaranteedWarClassification(report);
             reports.push(report);
           }
         } catch (e) { errors.push(e?.message || String(e)); }
-        await sleep(160);
+        await sleep(35);
       }
 
       state.loadedReports = reports.sort((a,b)=>(b.end||b.start)-(a.end||a.start));
@@ -2489,8 +2581,9 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
         <div class="pwi-kpi"><span>WINS IN DATA</span><b>${state.reports.filter(r=>['W','L'].includes(r.result)).length ? `${Math.round(m.winPct)}%` : '—'}</b></div>
       </div>
     </div>
-    <div class="pwi-section"><h3>🧭 TERMED-WAR GRAPH SCAN</h3>
-      <p>This is a <b>term-like likelihood</b>, not proof of a deal. The scanner prefers the historical graph; when TornPDA cannot expose it, it uses a lower-confidence completed-report estimate so the filters still work.</p>
+    <div class="pwi-section"><h3>⚡ HYBRID TERM FAST SCAN</h3>
+      <p>This is a <b>term-like likelihood</b>, not proof of a deal. Fast Scan uses cached timestamps first, then the completed report, and only opens Torn's slower historical graph when the result is genuinely ambiguous.</p>
+      <div class="pwi-note"><b>FAST SCAN:</b> repeat scans reuse completed-war reports, timestamp timelines and classifications. Use <b>FORCE RESCAN</b> only when you intentionally want every selected war rebuilt from scratch.</div>
       <div class="pwi-badge-row"><span class="pwi-pill tone-orange">${ts.known?Math.round(ts.termRate):0}% TERM-LIKE OF CLASSIFIED</span><span class="pwi-pill tone-red">${ts.very} VERY LIKELY</span><span class="pwi-pill tone-grey">${ts.unknown} NO CLASSIFICATION</span></div>
       ${(state.loadedReports||[]).map(rep=>{
         const g=rep.termGraph||{available:false,label:'NO CLASSIFICATION',tone:'grey',reasons:['Graph not scanned yet.']};
@@ -2502,7 +2595,7 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
           g.source==='timeline+report'?'TIMESTAMPS + REPORT':
           g.source==='report-fallback'?'REPORT EST.':
           g.source&&g.source!=='none'?'GRAPH':'AUTO';
-        const timelineMeta=tl?` • ${tl.events} timed attacks • overlap ${Math.round((tl.overlapRatio||0)*100)}% • longest lull ${tl.maxGapSeconds?Math.round(tl.maxGapSeconds/60)+'m':'—'} • final winner share ${Math.round((tl.finalWinnerShare||0)*100)}%`:'';
+        const timelineMeta=tl?` • ${tl.events} timed attacks${tl.truncated?' (sampled)':''} • overlap ${Math.round((tl.overlapRatio||0)*100)}% • longest lull ${tl.maxGapSeconds?Math.round(tl.maxGapSeconds/60)+'m':'—'} • final winner share ${Math.round((tl.finalWinnerShare||0)*100)}%`:'';
         return `<div class="pwi-termwar"><div class="pwi-termwar-top"><div class="pwi-termwar-name">${esc(fmtDate(rep.end||rep.start))} • vs ${esc(rep.opponentName||'Opponent')} • #${esc(rep.id)}</div><span class="pwi-pill tone-${g.tone}">${pct} ${esc(g.label)}</span></div><div class="pwi-termwar-meta">${sourceLabel} • CONFIDENCE ${esc(g.confidence||'LOW')}${timelineMeta}</div><div class="pwi-term-reasons">${(g.reasons||[]).slice(0,6).map(x=>`• ${esc(x)}`).join('<br>')}</div><div class="pwi-term-actions"><button class="pwi-btn ${ov==='term'?'active':''}" data-termoverride="term" data-war="${esc(rep.id)}">MARK TERMED</button><button class="pwi-btn ${ov==='competitive'?'active':''}" data-termoverride="competitive" data-war="${esc(rep.id)}">MARK COMPETITIVE</button><button class="pwi-btn ${ov==='auto'?'active':''}" data-termoverride="auto" data-war="${esc(rep.id)}">AUTO</button></div></div>`;
       }).join('')}
     </div>
@@ -2628,7 +2721,7 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
       <div class="pwi-scope"><button class="pwi-scopebtn ${state.scope==='own'?'active':''}" data-scope="own">🏠 MY FACTION</button><button class="pwi-scopebtn ${state.scope==='enemy'?'active':''}" data-scope="enemy">🎯 ENEMY</button></div>
       <div class="pwi-tabs">${[['profile','WAR PROFILE'],['team','WAR TEAM'],['members','MEMBERS'],['watch','PRE-WAR WATCH'],['help','HOW TO READ']].map(([v,l])=>`<button class="pwi-tab ${state.view===v?'active':''}" data-view="${v}">${l}</button>`).join('')}</div>
       ${state.view==='members'?`<div class="pwi-toolbar"><input id="pwi-search" value="${esc(state.filter)}" placeholder="Search member / ID / role…"><select id="pwi-sort"><option value="activityScore"${state.sort==='activityScore'?' selected':''}>War activity</option><option value="participation"${state.sort==='participation'?' selected':''}>Participation %</option><option value="avg"${state.sort==='avg'?' selected':''}>Avg hits</option><option value="totalHits"${state.sort==='totalHits'?' selected':''}>Total hits</option><option value="recent"${state.sort==='recent'?' selected':''}>Last war hits</option><option value="live"${state.sort==='live'?' selected':''}>Current activity</option><option value="level"${state.sort==='level'?' selected':''}>Level</option></select></div>`:''}
-      <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><button class="pwi-btn" data-act="wars" ${state.analyzing?'disabled':''}>SELECT WARS (${state.selectedWarIds.length})</button><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>RESCAN SELECTED</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
+      <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><button class="pwi-btn" data-act="wars" ${state.analyzing?'disabled':''}>SELECT WARS (${state.selectedWarIds.length})</button><button class="pwi-btn" data-act="fastscan" ${state.analyzing?'disabled':''}>FAST SCAN</button><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>FORCE RESCAN</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
       <div class="pwi-warfilter"><span>WAR TYPE:</span><button class="pwi-btn ${state.warTypeFilter==='all'?'active':''}" data-warfilter="all">ALL</button><button class="pwi-btn ${state.warTypeFilter==='competitive'?'active':''}" data-warfilter="competitive">COMPETITIVE-LIKE</button><button class="pwi-btn ${state.warTypeFilter==='term'?'active':''}" data-warfilter="term">TERM-LIKE</button></div>
       <div class="pwi-body">${body}</div></div>`;
   }
@@ -2758,6 +2851,7 @@ z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!impor
       state.progress = `${state.reports.length}/${state.loadedReports.length} wars • ${next==='term'?'TERM-LIKE':next==='competitive'?'COMPETITIVE-LIKE':'ALL'}`;
       render();
     }));
+    p.querySelector('[data-act="fastscan"]')?.addEventListener('click',()=>analyzeHistory(false));
     p.querySelector('[data-act="history"]')?.addEventListener('click',()=>analyzeHistory(true));
     p.querySelector('[data-act="export"]')?.addEventListener('click',exportCsv);
     p.querySelector('[data-act="key"]')?.addEventListener('click',()=>{state.apiKey='';storageSet('apiKey','');render();});
