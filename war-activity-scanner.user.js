@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.7.0
+// @version      3.7.1
 // @description  Standalone PDA-first war intelligence with hybrid termed-war detection using attack timestamps, participation patterns, graph/report evidence, faction/enemy comparison, and energy estimates.
 // @author       Fries91
 // @match        https://www.torn.com/*
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.7.0';
-  const BUILD = 'HYBRID-TIMELINE-TERM-DETECTOR-20260820';
+  const VERSION = '3.7.1';
+  const BUILD = 'PERSISTENT-SPY-HEADER-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -2096,18 +2096,24 @@
     const s = document.createElement('style');
     s.id = `${UI}-css-v350`;
     s.textContent = `
+#${UI}-header-slot{
+display:inline-flex!important;align-items:center!important;justify-content:center!important;
+width:25px!important;height:25px!important;min-width:25px!important;max-width:25px!important;
+margin:0 2px!important;padding:0!important;flex:0 0 auto!important;
+position:relative!important;z-index:2147483000!important;overflow:visible!important;
+}
 #${UI}-btn{
 display:inline-flex!important;align-items:center!important;justify-content:center!important;
-width:23px!important;height:23px!important;min-width:23px!important;max-width:23px!important;
-margin:0 2px!important;padding:0!important;border:0!important;border-radius:4px!important;
-background:transparent!important;color:inherit!important;font-size:16px!important;line-height:1!important;
+width:25px!important;height:25px!important;min-width:25px!important;max-width:25px!important;
+margin:0!important;padding:0!important;border:0!important;border-radius:5px!important;
+background:rgba(10,16,12,.18)!important;color:#fff!important;font-size:17px!important;line-height:1!important;
 font-weight:400!important;box-shadow:none!important;cursor:pointer!important;user-select:none!important;
 position:relative!important;left:auto!important;right:auto!important;top:auto!important;bottom:auto!important;
-z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
--webkit-appearance:none!important;appearance:none!important;transform:none!important
+z-index:2147483001!important;vertical-align:middle!important;flex:0 0 auto!important;
+-webkit-appearance:none!important;appearance:none!important;transform:none!important;opacity:1!important;
 }
-#${UI}-btn:hover{opacity:.95!important;filter:drop-shadow(0 1px 2px rgba(0,0,0,.75))}
-#${UI}-btn.pwi-header-hidden{display:none!important}
+#${UI}-btn:hover{filter:drop-shadow(0 1px 2px rgba(0,0,0,.75))}
+#${UI}-header-slot.pwi-header-hidden{display:none!important}
 #${UI}-panel{position:fixed;inset:0;z-index:999999;background:#0c110e;color:#edf5ef;font:13px/1.35 Arial,sans-serif;display:flex;flex-direction:column;overflow:hidden;overscroll-behavior:contain}
 #${UI}-panel *{box-sizing:border-box}
 .pwi-head{flex:0 0 auto;background:#131d16;border-bottom:1px solid #34443a;padding:7px 8px;display:flex;align-items:center;gap:6px}
@@ -2174,9 +2180,18 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 
   let lockedHeaderParent = null;
   let lockedHeaderAnchor = null;
+  let lastHeaderMountAt = 0;
 
   function makeLauncherButton() {
+    let slot = document.getElementById(`${UI}-header-slot`);
     let b = document.getElementById(`${UI}-btn`);
+
+    if (!slot) {
+      slot = document.createElement('span');
+      slot.id = `${UI}-header-slot`;
+      slot.title = 'WRATH War Intelligence';
+    }
+
     if (!b) {
       b = document.createElement('button');
       b.id = `${UI}-btn`;
@@ -2184,13 +2199,17 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       b.textContent = '🕵️';
       b.title = 'WRATH War Intelligence';
       b.setAttribute('aria-label', 'Open WRATH War Intelligence');
-      b.addEventListener('click', () => {
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         state.open = !state.open;
         render();
         if (state.open && state.apiKey) scanBase({ analyze: true, forceHistory: false });
       });
     }
-    return b;
+
+    if (b.parentElement !== slot) slot.appendChild(b);
+    return {slot, button:b};
   }
 
   function headerCandidateText(el) {
@@ -2202,125 +2221,203 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       el.getAttribute?.('title') || '',
       el.getAttribute?.('aria-label') || '',
       el.getAttribute?.('alt') || '',
-      String(el.innerHTML || '').slice(0, 180)
+      String(el.innerHTML || '').slice(0, 260)
     ].join(' ').toLowerCase();
+  }
+
+  function visibleRect(el) {
+    try {
+      const r = el?.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) return null;
+      if (r.bottom < 0 || r.top > innerHeight) return null;
+      return r;
+    } catch (_) { return null; }
+  }
+
+  function headerSearchBottom() {
+    // TornPDA's native toolbar changes the apparent vertical position of Torn's
+    // own header. Search a generous upper portion of the web viewport.
+    return Math.min(Math.max(420, innerHeight * 0.58), 680);
   }
 
   function findTornHeaderGenderTarget() {
     const nodes = Array.from(document.querySelectorAll('a,button,div,span,li,i,img,svg'));
     const candidates = [];
+    const maxTop = headerSearchBottom();
 
     for (const el of nodes) {
-      if (!el || el.id === `${UI}-btn` || el.closest?.(`#${UI}-panel`)) continue;
-
-      const r = el.getBoundingClientRect?.();
-      if (!r || r.width <= 0 || r.height <= 0) continue;
-
-      // Keep this search in Torn's upper header/resource area.
-      if (r.top < -5 || r.top > 340) continue;
-      if (r.left < window.innerWidth * 0.20) continue;
+      if (!el || el.id === `${UI}-btn` || el.id === `${UI}-header-slot` || el.closest?.(`#${UI}-panel`)) continue;
+      const r = visibleRect(el);
+      if (!r || r.top < -5 || r.top > maxTop) continue;
 
       const hay = headerCandidateText(el);
       const textOnly = String(el.textContent || '').trim();
 
       const genderHit =
-        textOnly.includes('♂') ||
-        textOnly.includes('♀') ||
-        hay.includes('gender') ||
-        hay.includes('male') ||
-        hay.includes('female') ||
-        hay.includes('&male') ||
-        hay.includes('&female');
+        textOnly === '♂' || textOnly === '♀' ||
+        textOnly.includes('♂') || textOnly.includes('♀') ||
+        /\bgender\b|\bmale\b|\bfemale\b/.test(hay);
 
       if (!genderHit) continue;
 
       let score = 0;
-      if (textOnly.includes('♂') || textOnly.includes('♀')) score += 140;
-      if (hay.includes('gender')) score += 100;
-      if (r.width >= 12 && r.width <= 50) score += 35;
-      if (r.height >= 12 && r.height <= 50) score += 35;
-      if (r.left > window.innerWidth * 0.45) score += 25;
-      score -= Math.abs(r.width - 24) * 0.4;
-      score -= Math.abs(r.height - 24) * 0.4;
+      if (textOnly === '♂' || textOnly === '♀') score += 240;
+      else if (textOnly.includes('♂') || textOnly.includes('♀')) score += 170;
+      if (/\bgender\b/.test(hay)) score += 110;
+      if (r.width >= 10 && r.width <= 55) score += 45;
+      if (r.height >= 10 && r.height <= 55) score += 45;
+      if (r.left > innerWidth * 0.20) score += 20;
+      score -= Math.abs(r.width - 25) * .3;
+      score -= Math.abs(r.height - 25) * .3;
 
-      candidates.push({ el, score });
+      candidates.push({el, score});
     }
 
-    candidates.sort((a, b) => b.score - a.score);
+    candidates.sort((a,b)=>b.score-a.score);
+    return candidates[0]?.el || null;
+  }
+
+  function findResourceRowByContent() {
+    const maxTop = headerSearchBottom();
+    const nodes = Array.from(document.querySelectorAll('div,section,nav,ul,header'));
+    const candidates = [];
+
+    for (const el of nodes) {
+      if (el.id === `${UI}-header-slot` || el.closest?.(`#${UI}-panel`)) continue;
+      const r = visibleRect(el);
+      if (!r || r.top < -5 || r.top > maxTop) continue;
+      if (r.width < Math.min(220, innerWidth * .45) || r.height < 22 || r.height > 95) continue;
+
+      const text = String(el.innerText || el.textContent || '').replace(/\s+/g,' ').trim();
+      if (!text || text.length > 260) continue;
+      const hay = headerCandidateText(el);
+
+      let score = 0;
+      // Torn's resource row normally has several of: money, points, merits/stars,
+      // gender, tokens/happy/health icons or compact numeric resources.
+      if (/\$[\d,.]+[kmb]?/i.test(text)) score += 80;
+      if (/(^|\s)P\s*\d+/i.test(text) || /\bpoints?\b/i.test(hay)) score += 65;
+      if (text.includes('♂') || text.includes('♀') || /\bgender\b|\bmale\b|\bfemale\b/.test(hay)) score += 70;
+      if (/[★⭐]/.test(text) || /\bmerit\b/i.test(hay)) score += 35;
+
+      const numericTokens = text.match(/\b\d+(?:[,.]\d+)?\b/g)?.length || 0;
+      if (numericTokens >= 2) score += 20;
+      if (numericTokens >= 4) score += 20;
+
+      const childCount = el.children?.length || 0;
+      if (childCount >= 4) score += 25;
+      if (childCount >= 7) score += 15;
+
+      if (score >= 65) candidates.push({el, score});
+    }
+
+    candidates.sort((a,b)=>b.score-a.score);
     return candidates[0]?.el || null;
   }
 
   function findTornHeaderResourceRow() {
-    // Fallback for header versions where the gender element has no useful label.
-    // Prefer compact flex-like rows in the top-right containing Torn resource items.
+    const maxTop = headerSearchBottom();
     const rows = Array.from(document.querySelectorAll(
-      'header, [class*="header"], [id*="header"], [class*="resource"], [class*="status"]'
+      'header, nav, [class*="header"], [id*="header"], [class*="resource"], [class*="status"], [class*="user"]'
     ));
     const candidates = [];
 
     for (const root of rows) {
-      const r = root.getBoundingClientRect?.();
-      if (!r || r.width <= 0 || r.height <= 0) continue;
-      if (r.top < -5 || r.top > 340) continue;
-
+      if (root.closest?.(`#${UI}-panel`)) continue;
+      const r = visibleRect(root);
+      if (!r || r.top < -5 || r.top > maxTop) continue;
       const children = Array.from(root.children || []);
       if (children.length < 2) continue;
 
       const hay = headerCandidateText(root);
       let score = 0;
-      if (hay.includes('point')) score += 50;
+      if (hay.includes('point')) score += 55;
       if (hay.includes('merit')) score += 45;
-      if (hay.includes('money') || hay.includes('cash')) score += 30;
-      if (hay.includes('gender') || hay.includes('male') || hay.includes('female')) score += 60;
-      if (r.left > window.innerWidth * 0.25) score += 20;
-      if (r.height <= 80) score += 20;
+      if (hay.includes('money') || hay.includes('cash')) score += 35;
+      if (hay.includes('gender') || hay.includes('male') || hay.includes('female')) score += 70;
+      if (r.height <= 90) score += 20;
+      if (children.length >= 5) score += 20;
 
-      if (score > 0) candidates.push({ el: root, score });
+      if (score > 40) candidates.push({el:root, score});
     }
 
-    candidates.sort((a, b) => b.score - a.score);
-    return candidates[0]?.el || null;
+    candidates.sort((a,b)=>b.score-a.score);
+    return candidates[0]?.el || findResourceRowByContent();
   }
 
-  function mountLauncherInTornHeader() {
-    const b = makeLauncherButton();
+  function mountSlotAfter(anchor, slot) {
+    if (!anchor?.parentElement) return false;
+    const parent = anchor.parentElement;
 
-    // If Torn has not destroyed the header we originally mounted into, do nothing.
-    // This is the key anti-jump rule: never rescan/reposition a live icon.
-    if (b.isConnected && !b.classList.contains('pwi-header-hidden') &&
-        lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) {
+    // If the slot is already exactly where we want it, leave it alone.
+    if (slot.parentElement === parent && slot.previousElementSibling === anchor) {
+      lockedHeaderParent = parent;
+      lockedHeaderAnchor = anchor;
+      slot.classList.remove('pwi-header-hidden');
       return true;
     }
 
-    // The old Torn header was actually replaced; only now are we allowed to find a new slot.
+    anchor.insertAdjacentElement('afterend', slot);
+    lockedHeaderParent = parent;
+    lockedHeaderAnchor = anchor;
+    slot.classList.remove('pwi-header-hidden');
+    return true;
+  }
+
+  function mountLauncherInTornHeader(force=false) {
+    const {slot} = makeLauncherButton();
+
+    // Anti-jump: as long as the exact mounted header survives, never reposition it.
+    if (!force && slot.isConnected && !slot.classList.contains('pwi-header-hidden') &&
+        lockedHeaderParent?.isConnected && slot.parentElement === lockedHeaderParent) {
+      return true;
+    }
+
     lockedHeaderParent = null;
     lockedHeaderAnchor = null;
 
     const gender = findTornHeaderGenderTarget();
-    if (gender?.parentElement) {
-      lockedHeaderAnchor = gender;
-      lockedHeaderParent = gender.parentElement;
-      gender.insertAdjacentElement('afterend', b);
-      b.classList.remove('pwi-header-hidden');
+    if (gender && mountSlotAfter(gender, slot)) {
+      lastHeaderMountAt = Date.now();
       return true;
     }
 
     const row = findTornHeaderResourceRow();
     if (row) {
+      // Prefer placing beside an existing compact resource item rather than as a
+      // free-floating page button.
+      const kids = Array.from(row.children || []).filter(x =>
+        x.id !== `${UI}-header-slot` && !x.closest?.(`#${UI}-panel`)
+      );
+      const anchor = kids.find(k => {
+        const t = String(k.textContent || '').trim();
+        const h = headerCandidateText(k);
+        return t.includes('♂') || t.includes('♀') || /\bgender\b|\bmale\b|\bfemale\b/.test(h);
+      });
+
+      if (anchor && mountSlotAfter(anchor, slot)) {
+        lastHeaderMountAt = Date.now();
+        return true;
+      }
+
+      // Stable fallback inside Torn's resource row.
+      row.appendChild(slot);
       lockedHeaderParent = row;
-      row.appendChild(b);
-      b.classList.remove('pwi-header-hidden');
+      slot.classList.remove('pwi-header-hidden');
+      lastHeaderMountAt = Date.now();
       return true;
     }
 
-    if (!b.isConnected) document.body.appendChild(b);
-    b.classList.add('pwi-header-hidden');
+    // Don't permanently lose the icon if TornPDA hasn't built the header yet.
+    // Keep it hidden in the document and the retry loop will remount it.
+    if (!slot.isConnected) (document.body || document.documentElement).appendChild(slot);
+    slot.classList.add('pwi-header-hidden');
     return false;
   }
 
-  function ensureUi() {
+  function ensureUi(force=false) {
     injectCss();
-    mountLauncherInTornHeader();
+    mountLauncherInTornHeader(force);
   }
 
   function phaseLabel() {
@@ -2714,12 +2811,22 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     if(state.apiKey) setTimeout(()=>scanBase({analyze:false,forceHistory:false}),1800);
     let headerMountTimer = null;
     const obs = new MutationObserver(() => {
-      const b = document.getElementById(`${UI}-btn`);
-      if (b?.isConnected && lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) return;
+      const slot = document.getElementById(`${UI}-header-slot`);
+      if (slot?.isConnected && !slot.classList.contains('pwi-header-hidden') &&
+          lockedHeaderParent?.isConnected && slot.parentElement === lockedHeaderParent) return;
       clearTimeout(headerMountTimer);
-      headerMountTimer = setTimeout(ensureUi, 180);
+      headerMountTimer = setTimeout(()=>ensureUi(false), 160);
     });
     obs.observe(document.documentElement,{childList:true,subtree:true});
+
+    // TornPDA sometimes rebuilds the header without a useful mutation at the exact
+    // moment our userscript can see it. A light recovery check prevents a lost icon.
+    setInterval(() => {
+      const slot = document.getElementById(`${UI}-header-slot`);
+      const healthy = slot?.isConnected && !slot.classList.contains('pwi-header-hidden') &&
+        lockedHeaderParent?.isConnected && slot.parentElement === lockedHeaderParent;
+      if (!healthy) ensureUi(false);
+    }, 2500);
   }
 
   init();
