@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.7.5
+// @version      3.7.6
 // @description  Standalone PDA-first war intelligence with hybrid termed-war detection using attack timestamps, participation patterns, graph/report evidence, faction/enemy comparison, and energy estimates.
 // @author       Fries91
 // @match        https://www.torn.com/*
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.7.5';
-  const BUILD = 'CURRENT-TORN-POINTS-ROW-MOUNT-20260820';
+  const VERSION = '3.7.6';
+  const BUILD = 'INDEPENDENT-LAUNCHER-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -2279,9 +2279,20 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       b.addEventListener('click', (e) => {
         e.preventDefault();
         e.stopPropagation();
+
+        // Launcher and scanner are deliberately separated.
+        // Opening/closing the panel must never remount or rebuild the launcher.
         state.open = !state.open;
         render();
-        if (state.open && state.apiKey) scanBase({ analyze: true, forceHistory: false });
+
+        // Let the panel paint first. Only then wake the scanner.
+        if (state.open && state.apiKey && !state.loading && !state.analyzing) {
+          setTimeout(() => {
+            if (state.open && state.apiKey && !state.loading && !state.analyzing) {
+              scanBase({ analyze: true, forceHistory: false }).catch(() => {});
+            }
+          }, 120);
+        }
       });
     }
     return b;
@@ -2532,7 +2543,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     return false;
   }
 
-  function ensureUi() {
+  function ensureLauncher() {
     injectCss();
     mountLauncherInTornHeader();
   }
@@ -2553,7 +2564,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 
   function keyScreen() {
     return `<div id="${UI}-panel">
-      <div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">HISTORICAL RANKED-WAR ACTIVITY</div></div><button class="pwi-btn" data-act="close">✕</button></div>
+      <div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">HISTORICAL RANKED-WAR ACTIVITY • INDEPENDENT LAUNCHER</div></div><button class="pwi-btn" data-act="close">✕</button></div>
       <div class="pwi-keybox">
         <h3 style="color:#82ff95;margin:0 0 6px">Torn API Key</h3>
         <div class="pwi-keynote">This script uses your key only to read Torn API data needed for your current/upcoming opponent and completed ranked-war reports. The key and cached analysis stay on this device and are not sent to any outside server.</div>
@@ -2752,7 +2763,8 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
   }
 
   function render() {
-    ensureUi();
+    // IMPORTANT: panel rendering is scanner/UI only.
+    // The header launcher is owned by startLauncherService() and is never touched here.
     const old = document.getElementById(`${UI}-panel`);
     const oldBody = old?.querySelector('.pwi-body');
     const scroll = oldBody?.scrollTop || 0;
@@ -2916,44 +2928,82 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
   }
 
   async function backgroundWatch() {
-    if (!state.apiKey) return;
-    if (!state.targetId) { await scanBase({analyze:false,forceHistory:false}); return; }
+    if (!state.open || !state.apiKey) return;
+    if (!state.targetId) {
+      await scanBase({analyze:false,forceHistory:false});
+      return;
+    }
     await liveRefresh();
   }
 
-  function init() {
-    state.apiKey=storageGet('apiKey',''); ensureUi();
-    clearInterval(state.timer); clearInterval(state.watchTimer); clearInterval(state.rediscoverTimer);
-    state.timer=setInterval(()=>{ if(state.open) liveRefresh(); },LIVE_REFRESH_MS);
-    state.watchTimer=setInterval(backgroundWatch,WATCH_REFRESH_MS);
-    state.rediscoverTimer=setInterval(()=>{ if(state.apiKey) scanBase({analyze:false,forceHistory:false}); },REDISCOVER_MS);
-    if(state.apiKey) setTimeout(()=>scanBase({analyze:false,forceHistory:false}),1800);
-    let headerMountTimer = null;
-    const obs = new MutationObserver(() => {
-      const b = document.getElementById(`${UI}-btn`);
-      if (
-        b?.isConnected &&
-        !b.classList.contains('pwi-header-hidden') &&
-        lockedHeaderParent?.isConnected &&
-        b.parentElement === lockedHeaderParent
-      ) return;
+  let launcherObserver = null;
+  let launcherRetryTimer = null;
+  let launcherHealthTimer = null;
 
-      clearTimeout(headerMountTimer);
-      headerMountTimer = setTimeout(ensureUi, 160);
+  function launcherIsHealthy() {
+    const b = document.getElementById(`${UI}-btn`);
+    return !!(
+      b?.isConnected &&
+      !b.classList.contains('pwi-header-hidden') &&
+      lockedHeaderParent?.isConnected &&
+      b.parentElement === lockedHeaderParent
+    );
+  }
+
+  function startLauncherService() {
+    injectCss();
+
+    // Mount immediately. This service has no API dependency and never calls scanBase().
+    ensureLauncher();
+
+    if (launcherObserver) {
+      try { launcherObserver.disconnect(); } catch (_) {}
+    }
+
+    launcherObserver = new MutationObserver(() => {
+      if (launcherIsHealthy()) return;
+      clearTimeout(launcherRetryTimer);
+      launcherRetryTimer = setTimeout(() => {
+        if (!launcherIsHealthy()) ensureLauncher();
+      }, 140);
     });
-    obs.observe(document.documentElement,{childList:true,subtree:true});
+    launcherObserver.observe(document.documentElement, { childList:true, subtree:true });
 
-    // Current TornPDA sometimes builds/rebuilds the resource row after document-idle.
-    // This is only a mount check; it does not move a healthy icon.
-    setInterval(() => {
-      const b = document.getElementById(`${UI}-btn`);
-      const healthy =
-        b?.isConnected &&
-        !b.classList.contains('pwi-header-hidden') &&
-        lockedHeaderParent?.isConnected &&
-        b.parentElement === lockedHeaderParent;
-      if (!healthy) ensureUi();
-    }, 2000);
+    clearInterval(launcherHealthTimer);
+    launcherHealthTimer = setInterval(() => {
+      if (!launcherIsHealthy()) ensureLauncher();
+    }, 1800);
+  }
+
+  function startScannerService() {
+    // Scanner timers are allowed to run only while the board is open.
+    // This prevents startup/background API work from interfering with the launcher.
+    clearInterval(state.timer);
+    clearInterval(state.watchTimer);
+    clearInterval(state.rediscoverTimer);
+
+    state.timer = setInterval(() => {
+      if (state.open && state.apiKey) liveRefresh();
+    }, LIVE_REFRESH_MS);
+
+    state.watchTimer = setInterval(() => {
+      if (state.open && state.apiKey) backgroundWatch();
+    }, WATCH_REFRESH_MS);
+
+    state.rediscoverTimer = setInterval(() => {
+      if (state.open && state.apiKey) scanBase({ analyze:false, forceHistory:false }).catch(() => {});
+    }, REDISCOVER_MS);
+
+    // NO startup scan here.
+  }
+
+  function init() {
+    // 1) Launcher first. No API key needed.
+    state.apiKey = storageGet('apiKey','');
+    startLauncherService();
+
+    // 2) Scanner exists separately and remains idle until the panel is opened.
+    startScannerService();
   }
 
   init();
