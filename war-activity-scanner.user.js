@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.7.4
+// @version      3.7.5
 // @description  Standalone PDA-first war intelligence with hybrid termed-war detection using attack timestamps, participation patterns, graph/report evidence, faction/enemy comparison, and energy estimates.
 // @author       Fries91
 // @match        https://www.torn.com/*
@@ -24,8 +24,8 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.7.4';
-  const BUILD = 'V361-TOP-POINTS-HEADER-RESTORE-20260820';
+  const VERSION = '3.7.5';
+  const BUILD = 'CURRENT-TORN-POINTS-ROW-MOUNT-20260820';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
@@ -2276,7 +2276,9 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       b.textContent = '🕵️';
       b.title = 'WRATH War Intelligence';
       b.setAttribute('aria-label', 'Open WRATH War Intelligence');
-      b.addEventListener('click', () => {
+      b.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
         state.open = !state.open;
         render();
         if (state.open && state.apiKey) scanBase({ analyze: true, forceHistory: false });
@@ -2285,39 +2287,124 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     return b;
   }
 
-  function headerCandidateText(el) {
-    if (!el) return '';
-    return [
-      el.textContent || '',
-      el.className || '',
-      el.id || '',
-      el.getAttribute?.('title') || '',
-      el.getAttribute?.('aria-label') || '',
-      el.getAttribute?.('alt') || '',
-      String(el.innerHTML || '').slice(0, 180)
-    ].join(' ').toLowerCase();
+  function headerCleanText(el) {
+    return String(el?.textContent || '').replace(/\s+/g, ' ').trim();
   }
 
-  function findTornHeaderGenderTarget() {
-    const nodes = Array.from(document.querySelectorAll('a,button,div,span,li,i,img,svg'));
+  function headerVisibleRect(el) {
+    if (!el || !el.getBoundingClientRect) return null;
+    const r = el.getBoundingClientRect();
+    if (!r || r.width < 4 || r.height < 4) return null;
+    const style = window.getComputedStyle(el);
+    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return null;
+    return r;
+  }
+
+  function looksLikeMoneyPointsMeritsRow(el) {
+    const text = headerCleanText(el);
+    const rect = headerVisibleRect(el);
+    const cls = String(el?.className || '');
+
+    if (!rect || rect.width < 250 || rect.height < 20 || rect.height > 55) return false;
+
+    // Current Torn/TornPDA resource row can expose hidden accessibility text such as:
+    // Money:$27.6M Points:115 Merits:4
+    const hasMoneyWords =
+      text.includes('Money:') &&
+      text.includes('Points:') &&
+      text.includes('Merits:');
+
+    const hasMoneySymbols =
+      text.includes('$') &&
+      (text.includes('Points') || /\bP\b/.test(text)) &&
+      (text.includes('Merits') || text.includes('★') || text.includes('⭐'));
+
+    const knownResourceClass =
+      cls.includes('swiperWrapper') ||
+      cls.includes('user-information-mobile') ||
+      cls.includes('userInformation') ||
+      cls.includes('user-info');
+
+    return (hasMoneyWords || hasMoneySymbols) &&
+      (knownResourceClass || rect.top > 80);
+  }
+
+  function findTornResourceRow() {
+    // Exact current TornPDA money / points / merits row first.
+    const exact = Array.from(document.querySelectorAll('div')).find(looksLikeMoneyPointsMeritsRow);
+    if (exact) return exact;
+
+    // Broader fallback, still restricted to the resource row.
+    const maxTop = Math.max(650, window.innerHeight * 0.62);
+    const candidates = Array.from(document.querySelectorAll('div, ul, nav, section')).filter((el) => {
+      const rect = headerVisibleRect(el);
+      if (!rect || rect.width < 250 || rect.height < 20 || rect.height > 60) return false;
+      if (rect.top < 0 || rect.top > maxTop) return false;
+
+      const text = headerCleanText(el);
+      const hay = [
+        text,
+        String(el.className || ''),
+        String(el.id || ''),
+        String(el.getAttribute?.('aria-label') || ''),
+        String(el.innerHTML || '').slice(0, 300)
+      ].join(' ').toLowerCase();
+
+      const money = text.includes('$') || hay.includes('money');
+      const points = hay.includes('points') || /\bp\b/i.test(text);
+      const merits = hay.includes('merit') || text.includes('★') || text.includes('⭐');
+
+      return money && points && merits;
+    });
+
+    if (!candidates.length) return null;
+
+    candidates.sort((a, b) => {
+      const ar = headerVisibleRect(a);
+      const br = headerVisibleRect(b);
+      const at = headerCleanText(a);
+      const bt = headerCleanText(b);
+
+      const score = (el, rect, txt) =>
+        (txt.includes('Money:') ? 60 : 0) +
+        (txt.includes('Points:') ? 55 : 0) +
+        (txt.includes('Merits:') ? 55 : 0) +
+        (String(el.className || '').includes('swiperWrapper') ? 40 : 0) -
+        Math.abs((rect?.height || 30) - 30);
+
+      return score(b, br, bt) - score(a, ar, at);
+    });
+
+    return candidates[0];
+  }
+
+  function findGlobalHeaderGenderTarget() {
+    const nodes = Array.from(document.querySelectorAll('a, button, div, span, li, i, img, svg'));
     const candidates = [];
+    const maxTop = Math.max(650, window.innerHeight * 0.62);
 
     for (const el of nodes) {
       if (!el || el.id === `${UI}-btn` || el.closest?.(`#${UI}-panel`)) continue;
 
-      const r = el.getBoundingClientRect?.();
-      if (!r || r.width <= 0 || r.height <= 0) continue;
+      const r = headerVisibleRect(el);
+      if (!r) continue;
+      if (r.top < 0 || r.top > maxTop) continue;
+      if (r.width > 70 || r.height > 70 || r.width < 8 || r.height < 8) continue;
 
-      // This is the original pre-3.6.2 top header/resource search.
-      if (r.top < -5 || r.top > 340) continue;
-      if (r.left < window.innerWidth * 0.20) continue;
-
-      const hay = headerCandidateText(el);
-      const textOnly = String(el.textContent || '').trim();
+      const text = headerCleanText(el);
+      const hay = [
+        text,
+        String(el.className || ''),
+        String(el.id || ''),
+        String(el.getAttribute?.('title') || ''),
+        String(el.getAttribute?.('alt') || ''),
+        String(el.getAttribute?.('aria-label') || ''),
+        String(el.innerHTML || '').slice(0, 160)
+      ].join(' ').toLowerCase();
 
       const genderHit =
-        textOnly.includes('♂') ||
-        textOnly.includes('♀') ||
+        text.includes('♂') ||
+        text.includes('♀') ||
         hay.includes('gender') ||
         hay.includes('male') ||
         hay.includes('female') ||
@@ -2326,14 +2413,18 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 
       if (!genderHit) continue;
 
-      let score = 0;
-      if (textOnly.includes('♂') || textOnly.includes('♀')) score += 140;
-      if (hay.includes('gender')) score += 100;
-      if (r.width >= 12 && r.width <= 50) score += 35;
-      if (r.height >= 12 && r.height <= 50) score += 35;
-      if (r.left > window.innerWidth * 0.45) score += 25;
-      score -= Math.abs(r.width - 24) * 0.4;
-      score -= Math.abs(r.height - 24) * 0.4;
+      let score =
+        ((text.includes('♂') || text.includes('♀')) ? 120 : 0) +
+        (hay.includes('gender') ? 90 : 0) +
+        (r.left > window.innerWidth * 0.25 ? 25 : 0) -
+        Math.abs(r.height - 24) -
+        Math.abs(r.width - 24);
+
+      // Extra preference when this icon is actually inside the money/points row.
+      if (el.closest && findTornResourceRow()) {
+        const row = findTornResourceRow();
+        if (row && row.contains(el)) score += 160;
+      }
 
       candidates.push({ el, score });
     }
@@ -2342,66 +2433,101 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     return candidates[0]?.el || null;
   }
 
-  function findTornHeaderResourceRow() {
-    const rows = Array.from(document.querySelectorAll(
-      'header, [class*="header"], [id*="header"], [class*="resource"], [class*="status"]'
-    ));
-    const candidates = [];
+  function findGenderInsertTarget(row) {
+    if (!row) return null;
 
-    for (const root of rows) {
-      const r = root.getBoundingClientRect?.();
-      if (!r || r.width <= 0 || r.height <= 0) continue;
-      if (r.top < -5 || r.top > 340) continue;
+    const all = Array.from(row.querySelectorAll('a, div, span, li, i, img, button, svg'));
 
-      const children = Array.from(root.children || []);
-      if (children.length < 2) continue;
+    let target = all.find((el) => {
+      const text = headerCleanText(el);
+      const cls = String(el.className || '').toLowerCase();
+      const title = String(el.getAttribute?.('title') || '').toLowerCase();
+      const alt = String(el.getAttribute?.('alt') || '').toLowerCase();
+      const aria = String(el.getAttribute?.('aria-label') || '').toLowerCase();
+      const html = String(el.innerHTML || '').toLowerCase();
 
-      const hay = headerCandidateText(root);
-      let score = 0;
-      if (hay.includes('point')) score += 50;
-      if (hay.includes('merit')) score += 45;
-      if (hay.includes('money') || hay.includes('cash')) score += 30;
-      if (hay.includes('gender') || hay.includes('male') || hay.includes('female')) score += 60;
-      if (r.left > window.innerWidth * 0.25) score += 20;
-      if (r.height <= 80) score += 20;
+      return (
+        text.includes('♂') ||
+        text.includes('♀') ||
+        cls.includes('gender') ||
+        title.includes('gender') ||
+        alt.includes('gender') ||
+        aria.includes('gender') ||
+        html.includes('male') ||
+        html.includes('female')
+      );
+    });
 
-      if (score > 0) candidates.push({ el: root, score });
-    }
+    if (target) return target;
 
-    candidates.sort((a, b) => b.score - a.score);
-    return candidates[0]?.el || null;
+    // If Torn hides the gender semantics, use merits/star as the stable neighbor.
+    target = all.find((el) => {
+      const text = headerCleanText(el);
+      const hay = [
+        String(el.className || ''),
+        String(el.getAttribute?.('title') || ''),
+        String(el.getAttribute?.('alt') || ''),
+        String(el.getAttribute?.('aria-label') || '')
+      ].join(' ').toLowerCase();
+
+      return (
+        text.includes('★') ||
+        text.includes('⭐') ||
+        hay.includes('merit')
+      );
+    });
+
+    return target || null;
   }
 
   function mountLauncherInTornHeader() {
     const b = makeLauncherButton();
 
-    // Exact old anti-jump behavior: once mounted in the top Torn header, do not move it.
-    if (b.isConnected && !b.classList.contains('pwi-header-hidden') &&
-        lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) {
+    // If our icon is still mounted in the exact resource row, never move it.
+    if (
+      b.isConnected &&
+      !b.classList.contains('pwi-header-hidden') &&
+      lockedHeaderParent?.isConnected &&
+      b.parentElement === lockedHeaderParent
+    ) {
       return true;
     }
 
     lockedHeaderParent = null;
     lockedHeaderAnchor = null;
 
-    const gender = findTornHeaderGenderTarget();
-    if (gender?.parentElement) {
-      lockedHeaderAnchor = gender;
-      lockedHeaderParent = gender.parentElement;
-      gender.insertAdjacentElement('afterend', b);
+    // Best current path: direct globally visible gender icon.
+    const globalGender = findGlobalHeaderGenderTarget();
+    if (globalGender?.parentElement) {
+      globalGender.insertAdjacentElement('afterend', b);
+      lockedHeaderAnchor = globalGender;
+      lockedHeaderParent = b.parentElement;
       b.classList.remove('pwi-header-hidden');
       return true;
     }
 
-    const row = findTornHeaderResourceRow();
+    // Exact points-system row, matching the banker/points setup.
+    const row = findTornResourceRow();
+    const target = row ? findGenderInsertTarget(row) : null;
+
+    if (target?.parentElement) {
+      target.insertAdjacentElement('afterend', b);
+      lockedHeaderAnchor = target;
+      lockedHeaderParent = b.parentElement;
+      b.classList.remove('pwi-header-hidden');
+      return true;
+    }
+
     if (row) {
-      lockedHeaderParent = row;
+      // Remain in the money / points / merits row even if Torn obscures gender.
       row.appendChild(b);
+      lockedHeaderParent = row;
       b.classList.remove('pwi-header-hidden');
       return true;
     }
 
-    if (!b.isConnected) document.body.appendChild(b);
+    // No lower-row or floating fallback. Wait until Torn's points row exists.
+    if (b.parentElement) b.remove();
     b.classList.add('pwi-header-hidden');
     return false;
   }
@@ -2805,12 +2931,29 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     let headerMountTimer = null;
     const obs = new MutationObserver(() => {
       const b = document.getElementById(`${UI}-btn`);
-      if (b?.isConnected && !b.classList.contains('pwi-header-hidden') &&
-          lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) return;
+      if (
+        b?.isConnected &&
+        !b.classList.contains('pwi-header-hidden') &&
+        lockedHeaderParent?.isConnected &&
+        b.parentElement === lockedHeaderParent
+      ) return;
+
       clearTimeout(headerMountTimer);
-      headerMountTimer = setTimeout(ensureUi, 180);
+      headerMountTimer = setTimeout(ensureUi, 160);
     });
     obs.observe(document.documentElement,{childList:true,subtree:true});
+
+    // Current TornPDA sometimes builds/rebuilds the resource row after document-idle.
+    // This is only a mount check; it does not move a healthy icon.
+    setInterval(() => {
+      const b = document.getElementById(`${UI}-btn`);
+      const healthy =
+        b?.isConnected &&
+        !b.classList.contains('pwi-header-hidden') &&
+        lockedHeaderParent?.isConnected &&
+        b.parentElement === lockedHeaderParent;
+      if (!healthy) ensureUi();
+    }, 2000);
   }
 
   init();
