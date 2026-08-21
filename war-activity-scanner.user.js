@@ -1,14 +1,14 @@
 // ==UserScript==
 // @name         WRATH War Intelligence v3 - My Faction + Enemy
 // @namespace    fries91.torn.prewarintel
-// @version      3.7.6
-// @description  Standalone PDA-first war intelligence with hybrid termed-war detection using attack timestamps, participation patterns, graph/report evidence, faction/enemy comparison, and energy estimates.
+// @version      3.7.7
+// @description  SAFE CORE build based on the last working v3.6.1 launcher. Optional deep term scan runs only when manually requested.
 // @author       Fries91
 // @match        https://www.torn.com/*
 // @match        https://torn.com/*
 // @icon         https://www.torn.com/favicon.ico
-// @updateURL    https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/war-activity-scanner.user.js
-// @downloadURL  https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/war-activity-scanner.user.js
+// @updateURL    https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/War%20activity%20script
+// @downloadURL  https://raw.githubusercontent.com/Fries91/War-activity-scanner/main/War%20activity%20script
 // @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
@@ -24,16 +24,12 @@
   const UI = 'wrathPreWarIntel';
   const STORE = 'wrathWarIntel'; // Keeps your API key / notes from the older WRATH scanner.
   const API = 'https://api.torn.com';
-  const VERSION = '3.7.6';
-  const BUILD = 'INDEPENDENT-LAUNCHER-20260820';
+  const VERSION = '3.7.7';
+  const BUILD = 'SAFE-CORE-MANUAL-DEEP-SCAN-20260821';
   const LIVE_REFRESH_MS = 90_000;
   const WATCH_REFRESH_MS = 5 * 60_000;
   const REDISCOVER_MS = 30 * 60_000;
   const HISTORY_CACHE_MS = 30 * 60_000;
-  const FAST_GRAPH_FALLBACK_DELAY_MS = 2500;
-  const FAST_TIMELINE_PAGE_LIMIT = 35;
-  const FAST_TIMELINE_ATTACK_LIMIT = 3500;
-  const FAST_TIMELINE_SAMPLE_WINDOWS = 8;
 
   const state = {
     open: false,
@@ -168,11 +164,6 @@
   function apiV2(path) {
     const sep = path.includes('?') ? '&' : '?';
     return requestJson(`${API}/v2${path}${sep}key=${encodeURIComponent(state.apiKey)}`);
-  }
-
-  function setProgress(msg) {
-    state.progress = msg || '';
-    if (state.open) render();
   }
 
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
@@ -467,8 +458,249 @@
   function loadReportByWar(targetId, warId) { return storageGet(reportCacheKey(targetId, warId), null); }
   function saveReportByWar(targetId, warId, report) { storageSet(reportCacheKey(targetId, warId), report); }
 
-  const TERM_GRAPH_ALGO = 6;
-  const TERM_TIMELINE_ALGO = 2;
+  const TERM_GRAPH_ALGO = 2;
+  const DEEP_TERM_ALGO = 1;
+  function deepTermCacheKey(warId) { return `deepTermScan:${warId}:v${DEEP_TERM_ALGO}`; }
+  function loadDeepTerm(warId) { return storageGet(deepTermCacheKey(warId), null); }
+  function saveDeepTerm(warId, value) { storageSet(deepTermCacheKey(warId), value); }
+
+  function medianNumber(vals) {
+    const a=(vals||[]).filter(Number.isFinite).slice().sort((x,y)=>x-y);
+    if(!a.length) return 0;
+    const m=Math.floor(a.length/2);
+    return a.length%2?a[m]:(a[m-1]+a[m])/2;
+  }
+
+  function deepAttackRows(data) {
+    const raw=data?.attacks || data?.data || [];
+    if(Array.isArray(raw)) return raw;
+    if(raw && typeof raw==='object') return Object.entries(raw).map(([id,x])=>({id,...(x||{})}));
+    return [];
+  }
+
+  function deepAttackTime(a) {
+    return num(a?.ended || a?.timestamp_ended || a?.end || a?.timestamp || a?.started || a?.timestamp_started);
+  }
+
+  function deepFactionId(side, fallback) {
+    return num(
+      side?.faction?.id ||
+      side?.faction_id ||
+      (typeof side?.faction==='number' ? side.faction : 0) ||
+      fallback
+    );
+  }
+
+  function deepNormalizeAttack(a, report) {
+    const t=deepAttackTime(a);
+    if(!t) return null;
+    const attacker=a?.attacker || {};
+    const af=deepFactionId(attacker, a?.attacker_faction_id || a?.attacker_faction);
+    let side='';
+    if(af===num(state.targetId)) side='A';
+    else if(af===num(report?.opponentId)) side='B';
+    else return null;
+
+    const ranked=a?.is_ranked_war ?? a?.ranked_war ?? a?.rankedWar;
+    if(ranked===false || ranked===0 || ranked==='0') return null;
+
+    return {
+      t, side,
+      attackerId:num(attacker?.id || a?.attacker_id),
+      respect:num(a?.respect_gain ?? a?.respect ?? a?.score ?? 0)
+    };
+  }
+
+  function deepParticipationCap(members) {
+    const active=(members||[]).map(m=>num(m.attacks)).filter(n=>n>0);
+    if(active.length<5) return {share:0,mode:0,oneToFive:0};
+    const freq={};
+    active.filter(n=>n<=20).forEach(n=>freq[n]=(freq[n]||0)+1);
+    let mode=0,count=0;
+    Object.entries(freq).forEach(([n,c])=>{if(c>count){mode=num(n);count=c;}});
+    const near=mode?active.filter(n=>n<=20 && Math.abs(n-mode)<=1).length/active.length:0;
+    return {share:near,mode,oneToFive:active.filter(n=>n<=5).length/active.length};
+  }
+
+  function deepTimelineClassify(events, report) {
+    if(!events?.length) return null;
+    const start=num(report.start)||events[0].t;
+    const end=num(report.end)||events[events.length-1].t;
+    const duration=Math.max(1,end-start);
+
+    const buckets=new Map();
+    for(const e of events){
+      const k=Math.floor((e.t-start)/600);
+      if(!buckets.has(k)) buckets.set(k,{a:0,b:0});
+      const x=buckets.get(k);
+      e.side==='A'?x.a++:x.b++;
+    }
+    const active=[...buckets.values()].filter(x=>x.a+x.b);
+    const overlap=active.length?active.filter(x=>x.a&&x.b).length/active.length:0;
+
+    let maxGap=0,longQuiet=0,switches=0;
+    const switchGaps=[];
+    for(let i=1;i<events.length;i++){
+      const gap=events[i].t-events[i-1].t;
+      maxGap=Math.max(maxGap,gap);
+      if(gap>1800) longQuiet += gap-1800;
+      if(events[i].side!==events[i-1].side){
+        switches++;
+        switchGaps.push(gap);
+      }
+    }
+    const quietRatio=Math.min(1,longQuiet/duration);
+    const switchRate=events.length>1?switches/(events.length-1):0;
+    const medianSwitch=medianNumber(switchGaps);
+
+    const winnerSide=report.result==='W'?'A':report.result==='L'?'B':'';
+    const loserSide=winnerSide==='A'?'B':winnerSide==='B'?'A':'';
+    const loserEvents=events.filter(e=>e.side===loserSide);
+    const loserStop=loserEvents.length?Math.max(0,end-loserEvents[loserEvents.length-1].t):0;
+    const finalStart=start+duration*.80;
+    const final=events.filter(e=>e.t>=finalStart);
+    const finalWinnerShare=final.length&&winnerSide?final.filter(e=>e.side===winnerSide).length/final.length:0;
+
+    const capA=deepParticipationCap(report.members);
+    const capB=deepParticipationCap(report.opponentMembers);
+    const capShare=Math.max(capA.share,capB.share);
+    const capMode=capA.share>=capB.share?capA.mode:capB.mode;
+
+    let score=35;
+    const reasons=[];
+
+    if(overlap<=.12 && duration>=4*3600){score+=22;reasons.push(`Only ${Math.round(overlap*100)}% of active 10-minute windows had both factions hitting.`);}
+    else if(overlap>=.45){score-=22;reasons.push(`${Math.round(overlap*100)}% of active windows had both factions hitting — strong competitive pressure.`);}
+
+    if(maxGap>=90*60){score+=18;reasons.push(`Longest no-hit gap was ${(maxGap/3600).toFixed(1)}h.`);}
+    else if(maxGap>=45*60){score+=9;reasons.push(`Longest no-hit gap was ${Math.round(maxGap/60)}m.`);}
+
+    if(quietRatio>=.25){score+=14;reasons.push(`${Math.round(quietRatio*100)}% of the war was extended quiet time.`);}
+
+    if(switchRate>=.28 && medianSwitch>0 && medianSwitch<=180){score-=12;reasons.push(`Fast back-and-forth pressure; median side switch ${Math.round(medianSwitch)}s.`);}
+    else if(switchRate<=.08 && duration>=4*3600){score+=9;reasons.push('Very little back-and-forth activity between factions.');}
+
+    if(loserStop>=45*60 && finalWinnerShare>=.80){score+=20;reasons.push(`Loser stopped ${Math.round(loserStop/60)}m before the end while winner controlled the final phase.`);}
+
+    if(capShare>=.45 && capMode>0 && capMode<=12){score+=14;reasons.push(`Many participants cluster around a small ~${capMode}-hit cap.`);}
+
+    score=Math.max(0,Math.min(100,Math.round(score)));
+    return {
+      likelihood:score,
+      reasons:reasons.slice(0,6),
+      features:{events:events.length,overlap,maxGap,quietRatio,switchRate,medianSwitch,loserStop,finalWinnerShare,capShare,capMode}
+    };
+  }
+
+  async function fetchDeepTimeline(report, force=false) {
+    if(!force){
+      const cached=loadDeepTerm(report.id);
+      if(cached) return cached;
+    }
+
+    // Only try detailed faction attacks for wars involving the API owner's faction.
+    if(num(state.targetId)!==num(state.ownId)){
+      return {available:false,reason:'Detailed timestamps are available only for your own faction with suitable faction API access.'};
+    }
+
+    const from=Math.max(0,num(report.start)-15);
+    const to=num(report.end)+30;
+    if(!from || !to) return {available:false,reason:'War timestamps unavailable.'};
+
+    const raw=[];
+    let cursor=from;
+    let pages=0;
+
+    try{
+      while(cursor<=to && pages<8 && raw.length<800){
+        pages++;
+        state.progress=`DEEP TERM SCAN • war #${report.id} • timestamp page ${pages}`;
+        render();
+
+        const data=await apiV2(`/faction/attacks?from=${cursor}&to=${to}&limit=100&sort=ASC`);
+        const rows=deepAttackRows(data);
+        if(!rows.length) break;
+        raw.push(...rows);
+
+        const times=rows.map(deepAttackTime).filter(Boolean);
+        const mx=times.length?Math.max(...times):0;
+        if(!mx || rows.length<100 || mx>=to) break;
+        if(mx+1<=cursor) break;
+        cursor=mx+1;
+        await sleep(60);
+      }
+    }catch(e){
+      return {available:false,reason:e?.message||String(e)};
+    }
+
+    const events=raw.map(a=>deepNormalizeAttack(a,report)).filter(Boolean)
+      .filter(e=>e.t>=from&&e.t<=to).sort((a,b)=>a.t-b.t);
+
+    if(!events.length) return {available:false,reason:'No identifiable ranked-war timestamp events were returned.'};
+
+    const classified=deepTimelineClassify(events,report);
+    if(!classified) return {available:false,reason:'Timeline could not be classified.'};
+
+    const out={available:true,...classified,pages};
+    saveDeepTerm(report.id,out);
+    return out;
+  }
+
+  async function runManualDeepTermScan(force=true) {
+    if(state.analyzing) return;
+    if(!state.loadedReports.length){
+      state.warning='Load/select wars first, then press DEEP TERM SCAN.';
+      render();
+      return;
+    }
+
+    state.analyzing=true;
+    state.warning='';
+    try{
+      for(let i=0;i<state.loadedReports.length;i++){
+        const rep=state.loadedReports[i];
+        state.progress=`DEEP TERM SCAN • ${i+1}/${state.loadedReports.length}`;
+        render();
+
+        try{
+          const deep=await fetchDeepTimeline(rep,force);
+          if(deep?.available){
+            const base=num(rep.termGraph?.likelihood,50);
+            const combined=Math.round(deep.likelihood*.70+base*.30);
+            rep.termGraph={
+              ...(rep.termGraph||{}),
+              available:true,
+              likelihood:combined,
+              label:combined>=75?'VERY LIKELY TERM-LIKE • TIMESTAMPS':combined>=55?'POSSIBLY TERM-LIKE • TIMESTAMPS':'LIKELY COMPETITIVE • TIMESTAMPS',
+              tone:combined>=75?'red':combined>=55?'orange':'green',
+              source:'manual-timestamps',
+              confidence:deep.features?.events>=40?'HIGH':'MEDIUM',
+              reasons:[...(deep.reasons||[]),...((rep.termGraph?.reasons||[]).slice(0,2))].slice(0,7),
+              timeline:deep.features
+            };
+            saveTermGraph(rep.id,rep.termGraph);
+          }else{
+            rep.termGraph={
+              ...(rep.termGraph||classifyTermFromReport(rep)),
+              deepScanNote:deep?.reason||'Timestamp scan unavailable.'
+            };
+          }
+        }catch(_){
+          // Deep scan is intentionally isolated. One bad war can never stop the core scanner.
+        }
+      }
+
+      applyWarTypeFilter();
+      buildAnalysisRows();
+      state.progress=`DEEP TERM SCAN complete • ${state.loadedReports.length} wars`;
+    }catch(e){
+      state.warning=`Deep term scan stopped safely: ${e?.message||String(e)}. Core scanner is still running.`;
+    }finally{
+      state.analyzing=false;
+      render();
+    }
+  }
+
 
   function warTypeFilterKey(targetId) { return `warTypeFilter:${targetId}`; }
   function loadWarTypeFilter(targetId) {
@@ -488,436 +720,6 @@
   }
   function saveTermGraph(warId, result) {
     storageSet(termGraphCacheKey(warId), { at: Date.now(), result });
-  }
-
-
-
-  function termTimelineCacheKey(warId) { return `termTimeline:${warId}:v${TERM_TIMELINE_ALGO}`; }
-
-  function loadTermTimeline(warId) {
-    const c = storageGet(termTimelineCacheKey(warId), null);
-    if (!c || !c.result) return null;
-    return c.result;
-  }
-
-  function saveTermTimeline(warId, result) {
-    storageSet(termTimelineCacheKey(warId), { at: Date.now(), result });
-  }
-
-  function attackRows(data) {
-    const a = data?.attacks || data?.data || [];
-    if (Array.isArray(a)) return a;
-    if (a && typeof a === 'object') return Object.entries(a).map(([id,x]) => ({ id:num(x?.id || id), ...x }));
-    return [];
-  }
-
-  function attackTimestamp(a) {
-    return num(a?.ended || a?.timestamp_ended || a?.end || a?.timestamp || a?.started || a?.timestamp_started);
-  }
-
-  function attackFactionId(sideObj) {
-    if (!sideObj) return 0;
-    if (typeof sideObj === 'number' || typeof sideObj === 'string') return num(sideObj);
-    return num(sideObj?.faction?.id || sideObj?.faction_id || sideObj?.faction || sideObj?.id);
-  }
-
-  function attackUserId(sideObj) {
-    if (!sideObj) return 0;
-    if (typeof sideObj === 'number' || typeof sideObj === 'string') return num(sideObj);
-    return num(sideObj?.id || sideObj?.user_id || sideObj?.player_id);
-  }
-
-  function normalizeAttackEvent(a, report) {
-    const t = attackTimestamp(a);
-    if (!t) return null;
-
-    const attacker = a?.attacker || {};
-    const defender = a?.defender || {};
-    const attackerFaction = num(
-      attacker?.faction?.id || a?.attacker_faction || a?.attacker_faction_id ||
-      (typeof attacker?.faction === 'number' ? attacker.faction : 0)
-    );
-    const defenderFaction = num(
-      defender?.faction?.id || a?.defender_faction || a?.defender_faction_id ||
-      (typeof defender?.faction === 'number' ? defender.faction : 0)
-    );
-
-    let side = '';
-    if (attackerFaction === num(state.targetId)) side = 'A';
-    else if (attackerFaction === num(report?.opponentId)) side = 'B';
-    else return null;
-
-    const rankedFlag = a?.is_ranked_war ?? a?.ranked_war ?? a?.rankedWar;
-    if (rankedFlag === false || rankedFlag === 0 || rankedFlag === '0') return null;
-
-    return {
-      id: String(a?.id || a?.attack_id || ''),
-      t,
-      side,
-      attackerId: num(attacker?.id || a?.attacker_id),
-      defenderId: num(defender?.id || a?.defender_id),
-      result: String(a?.result || ''),
-      respect: num(a?.respect_gain ?? a?.respect ?? a?.score ?? 0),
-      interrupted: !!(a?.is_interrupted || a?.interrupted),
-      attackerFaction,
-      defenderFaction
-    };
-  }
-
-  async function fetchOwnFactionWarTimeline(report, force=false, progressCtx=null) {
-    const cached = !force ? loadTermTimeline(report?.id) : null;
-    if (cached) {
-      if (progressCtx) setProgress(`${progressCtx} • timestamps cached`);
-      return cached;
-    }
-
-    const involvesOwnFaction = num(state.ownId) &&
-      (num(state.targetId) === num(state.ownId) || num(report?.opponentId) === num(state.ownId));
-
-    if (!involvesOwnFaction || !report?.start || !report?.end) {
-      const result = { available:false, reason:'Detailed timestamps are only available for wars involving your own faction with sufficient faction API access.' };
-      saveTermTimeline(report?.id, result);
-      return result;
-    }
-
-    const fromStart = Math.max(0, num(report.start) - 15);
-    const toEnd = num(report.end) + 30;
-    const raw = [];
-    let permissionError = '';
-    let pages = 0;
-    let sampled = false;
-
-    try {
-      if (!force) {
-        // FAST SCAN: sample the entire war evenly instead of paging every single
-        // attack. This keeps early/mid/late activity represented with a small,
-        // predictable number of API calls.
-        sampled = true;
-        const span = Math.max(1, toEnd - fromStart);
-        const windows = Math.max(4, FAST_TIMELINE_SAMPLE_WINDOWS);
-        for (let i = 0; i < windows; i++) {
-          const a = Math.floor(fromStart + span * (i / windows));
-          const b = Math.floor(fromStart + span * ((i + 1) / windows));
-          pages++;
-          if (progressCtx) setProgress(`${progressCtx} • timestamp sample ${i + 1}/${windows} • ${raw.length} attacks`);
-          const data = await apiV2(`/faction/attacks?from=${a}&to=${b}&limit=100&sort=ASC`);
-          const rows = attackRows(data);
-          raw.push(...rows);
-          await sleep(45);
-        }
-      } else {
-        // FORCE RESCAN: exhaustive pagination for the most complete possible
-        // timeline. Slower, but useful when validating a known war.
-        let cursor = fromStart;
-        while (cursor <= toEnd && pages < FAST_TIMELINE_PAGE_LIMIT && raw.length < FAST_TIMELINE_ATTACK_LIMIT) {
-          pages++;
-          if (progressCtx) setProgress(`${progressCtx} • full timestamps page ${pages} • ${raw.length} attacks`);
-          const data = await apiV2(`/faction/attacks?from=${cursor}&to=${toEnd}&limit=100&sort=ASC`);
-          const rows = attackRows(data);
-          if (!rows.length) break;
-
-          raw.push(...rows);
-          const times = rows.map(attackTimestamp).filter(Boolean);
-          const maxT = times.length ? Math.max(...times) : 0;
-          if (!maxT || rows.length < 100 || maxT >= toEnd) break;
-
-          const next = maxT + 1;
-          if (next <= cursor) break;
-          cursor = next;
-          await sleep(65);
-        }
-      }
-    } catch (e) {
-      permissionError = e?.message || String(e);
-    }
-
-    if (!raw.length) {
-      const result = {
-        available:false,
-        reason: permissionError
-          ? `Faction attack timestamps unavailable: ${permissionError}`
-          : 'No detailed ranked-war attacks were returned for this war.'
-      };
-      saveTermTimeline(report.id, result);
-      return result;
-    }
-
-    const seen = new Set();
-    const events = raw
-      .map(a => normalizeAttackEvent(a, report))
-      .filter(Boolean)
-      .filter(e => {
-        if (e.t < fromStart || e.t > toEnd) return false;
-        const k = e.id || `${e.t}:${e.side}:${e.attackerId}:${e.defenderId}:${e.result}`;
-        if (seen.has(k)) return false;
-        seen.add(k);
-        return true;
-      })
-      .sort((a,b)=>a.t-b.t);
-
-    if (!events.length) {
-      const result = { available:false, reason:'Attack history loaded, but no attacks were identifiable as belonging to the selected ranked war.' };
-      saveTermTimeline(report.id, result);
-      return result;
-    }
-
-    const result = analyzeAttackTimeline(events, report);
-    result.pages = pages;
-    result.sampled = sampled;
-    result.sampleWindows = sampled ? FAST_TIMELINE_SAMPLE_WINDOWS : 0;
-    result.truncated = sampled || (!sampled && (pages >= FAST_TIMELINE_PAGE_LIMIT || raw.length >= FAST_TIMELINE_ATTACK_LIMIT));
-    saveTermTimeline(report.id, result);
-    return result;
-  }
-
-  function median(values) {
-    const a = (values || []).filter(Number.isFinite).slice().sort((x,y)=>x-y);
-    if (!a.length) return 0;
-    const m = Math.floor(a.length/2);
-    return a.length % 2 ? a[m] : (a[m-1]+a[m])/2;
-  }
-
-  function participationCapSignal(members) {
-    const active = (members || []).map(m=>num(m.attacks)).filter(n=>n>0);
-    if (active.length < 5) return {active:active.length, lowCapShare:0, modeHits:0, modeShare:0, oneToFiveShare:0};
-
-    const oneToFive = active.filter(n=>n<=5).length / active.length;
-    const counts = new Map();
-    for (const n of active) {
-      if (n <= 20) counts.set(n, (counts.get(n)||0)+1);
-    }
-    let modeHits=0, modeCount=0;
-    for (const [n,c] of counts) if (c > modeCount) { modeHits=n; modeCount=c; }
-
-    const modeShare = modeCount / active.length;
-    const nearModeShare = modeHits
-      ? active.filter(n => n <= 20 && Math.abs(n-modeHits)<=1).length / active.length
-      : 0;
-
-    return {
-      active:active.length,
-      lowCapShare:nearModeShare,
-      modeHits,
-      modeShare,
-      oneToFiveShare:oneToFive
-    };
-  }
-
-  function analyzeAttackTimeline(events, report) {
-    const start = num(report?.start) || events[0].t;
-    const end = num(report?.end) || events[events.length-1].t;
-    const duration = Math.max(1, end-start);
-    const hours = duration/3600;
-
-    const aEvents = events.filter(e=>e.side==='A');
-    const bEvents = events.filter(e=>e.side==='B');
-    const bothSides = aEvents.length >= 5 && bEvents.length >= 5;
-
-    const bucketSize = 10*60;
-    const buckets = new Map();
-    for (const e of events) {
-      const i = Math.floor((e.t-start)/bucketSize);
-      if (!buckets.has(i)) buckets.set(i,{a:0,b:0,ar:0,br:0});
-      const x=buckets.get(i);
-      if(e.side==='A'){x.a++;x.ar+=Math.max(0,e.respect);}
-      else{x.b++;x.br+=Math.max(0,e.respect);}
-    }
-
-    const activeBuckets = [...buckets.values()].filter(x=>x.a+x.b>0);
-    const overlapBuckets = activeBuckets.filter(x=>x.a>0 && x.b>0).length;
-    const overlapRatio = activeBuckets.length ? overlapBuckets/activeBuckets.length : 0;
-    const oneSidedBuckets = activeBuckets.filter(x=>{
-      const total=x.a+x.b;
-      return total>=2 && Math.max(x.a,x.b)/total >= .85;
-    }).length;
-    const oneSidedBucketRatio = activeBuckets.length ? oneSidedBuckets/activeBuckets.length : 0;
-
-    const gaps=[];
-    let longQuietSeconds=0, maxGap=0;
-    for(let i=1;i<events.length;i++){
-      const gap=Math.max(0,events[i].t-events[i-1].t);
-      gaps.push(gap);
-      maxGap=Math.max(maxGap,gap);
-      if(gap>30*60) longQuietSeconds += gap-30*60;
-    }
-    const quietRatio=Math.min(1,longQuietSeconds/duration);
-
-    let switches=0;
-    const switchGaps=[];
-    for(let i=1;i<events.length;i++){
-      if(events[i].side!==events[i-1].side){
-        switches++;
-        switchGaps.push(events[i].t-events[i-1].t);
-      }
-    }
-    const switchRate=events.length>1 ? switches/(events.length-1) : 0;
-    const medianSwitchGap=median(switchGaps);
-
-    const lastA=aEvents.length?aEvents[aEvents.length-1].t:0;
-    const lastB=bEvents.length?bEvents[bEvents.length-1].t:0;
-    const winnerSide = report?.result==='W' ? 'A' : report?.result==='L' ? 'B' : '';
-    const loserSide = winnerSide==='A'?'B':winnerSide==='B'?'A':'';
-    const lastLoser = loserSide==='A'?lastA:loserSide==='B'?lastB:0;
-    const loserStoppedBeforeEnd = lastLoser ? Math.max(0,end-lastLoser) : 0;
-
-    const finalStart=start+duration*.80;
-    const finalEvents=events.filter(e=>e.t>=finalStart);
-    const finalWinnerHits=winnerSide ? finalEvents.filter(e=>e.side===winnerSide).length : 0;
-    const finalWinnerShare=finalEvents.length&&winnerSide ? finalWinnerHits/finalEvents.length : 0;
-
-    const aRespect=aEvents.reduce((s,e)=>s+Math.max(0,e.respect),0);
-    const bRespect=bEvents.reduce((s,e)=>s+Math.max(0,e.respect),0);
-    const respectHi=Math.max(aRespect,bRespect), respectLo=Math.min(aRespect,bRespect);
-    const respectBalance=respectHi>0?respectLo/respectHi:0;
-
-    const aCap=participationCapSignal(report?.members||[]);
-    const bCap=participationCapSignal(report?.opponentMembers||[]);
-    const capShare=Math.max(aCap.lowCapShare,bCap.lowCapShare);
-    const oneToFiveAvg=(aCap.active&&bCap.active)?(aCap.oneToFiveShare+bCap.oneToFiveShare)/2:Math.max(aCap.oneToFiveShare,bCap.oneToFiveShare);
-
-    const hitsPerHour=events.length/Math.max(.1,hours);
-
-    return {
-      available:true,
-      events:events.length,
-      aEvents:aEvents.length,
-      bEvents:bEvents.length,
-      bothSides,
-      durationHours:hours,
-      activeBuckets:activeBuckets.length,
-      overlapBuckets,
-      overlapRatio,
-      oneSidedBucketRatio,
-      maxGapSeconds:maxGap,
-      quietRatio,
-      switchRate,
-      medianSwitchGap,
-      loserStoppedBeforeEnd,
-      finalWinnerShare,
-      hitsPerHour,
-      respectA:aRespect,
-      respectB:bRespect,
-      respectBalance,
-      capShare,
-      oneToFiveAvg,
-      aCap,
-      bCap,
-      pages:0
-    };
-  }
-
-  function classifyTimelineEvidence(t, report) {
-    if (!t?.available) return {available:false, likelihood:null, reasons:[t?.reason||'No timestamp timeline available.'], confidence:'NONE'};
-
-    let likelihood = 35;
-    const reasons=[];
-    const strong = t.bothSides;
-    const sampled = !!t.sampled;
-
-    if (sampled) reasons.push(`Fast Scan sampled ${t.sampleWindows || FAST_TIMELINE_SAMPLE_WINDOWS} time windows across the war; use FORCE RESCAN for a full timestamp timeline.`);
-
-    if (strong) {
-      if (t.overlapRatio >= .48) {
-        likelihood -= 24; reasons.push(`${Math.round(t.overlapRatio*100)}% of active 10-minute windows contain hits from both factions — strong competitive pressure.`);
-      } else if (t.overlapRatio >= .30) {
-        likelihood -= 12; reasons.push(`${Math.round(t.overlapRatio*100)}% of active windows overlap between both factions.`);
-      } else if (t.overlapRatio <= .12 && t.durationHours >= 4) {
-        likelihood += 20; reasons.push(`Only ${Math.round(t.overlapRatio*100)}% of active 10-minute windows contain both sides — unusually separated scoring.`);
-      }
-
-      if (t.oneSidedBucketRatio >= .72 && t.durationHours >= 4) {
-        likelihood += 13; reasons.push(`${Math.round(t.oneSidedBucketRatio*100)}% of active windows are dominated by only one faction.`);
-      }
-
-      if (t.switchRate >= .30 && t.medianSwitchGap > 0 && t.medianSwitchGap <= 150) {
-        likelihood -= 13; reasons.push(`Frequent counter-activity with a ${Math.round(t.medianSwitchGap)}s median side-switch gap.`);
-      } else if (t.switchRate <= .08 && t.durationHours >= 4) {
-        likelihood += 10; reasons.push('Very little back-and-forth switching between factions.');
-      }
-
-      if (t.respectBalance >= .70 && t.overlapRatio >= .35) {
-        likelihood -= 8; reasons.push('Respect production is balanced while both factions are active in the same windows.');
-      }
-    } else {
-      reasons.push('Only one side of the detailed attack timeline was visible, so timestamp confidence is reduced.');
-    }
-
-    if (!sampled) {
-      if (t.maxGapSeconds >= 90*60) {
-        likelihood += 18; reasons.push(`Longest no-hit gap is ${(t.maxGapSeconds/3600).toFixed(1)}h.`);
-      } else if (t.maxGapSeconds >= 45*60 && t.durationHours >= 4) {
-        likelihood += 10; reasons.push(`Longest no-hit gap is ${Math.round(t.maxGapSeconds/60)}m.`);
-      }
-
-      if (t.quietRatio >= .25) {
-        likelihood += 15; reasons.push(`${Math.round(t.quietRatio*100)}% of war time is extended quiet time beyond 30-minute gaps.`);
-      } else if (t.quietRatio >= .12) {
-        likelihood += 7; reasons.push(`${Math.round(t.quietRatio*100)}% of war time is extended quiet time.`);
-      }
-    }
-
-    if (t.loserStoppedBeforeEnd >= 45*60 && t.finalWinnerShare >= .80) {
-      likelihood += sampled ? 10 : 20; reasons.push(`Losing side stopped ${Math.round(t.loserStoppedBeforeEnd/60)}m before the end while the winner controlled ${Math.round(t.finalWinnerShare*100)}% of the final phase${sampled?' in the sampled timeline':''}.`);
-    } else if (t.loserStoppedBeforeEnd >= 20*60 && t.finalWinnerShare >= .85) {
-      likelihood += sampled ? 6 : 11; reasons.push(`The losing side stops early and the winner performs most late-war attacks${sampled?' in the sampled timeline':''}.`);
-    }
-
-    if (t.capShare >= .45 && Math.max(t.aCap?.modeHits||0,t.bCap?.modeHits||0) <= 12) {
-      likelihood += 14;
-      const cap=Math.max(t.aCap?.modeHits||0,t.bCap?.modeHits||0);
-      reasons.push(`Member participation clusters around a small hit cap${cap?` (~${cap} hits)`:''}, a common arranged-war pattern.`);
-    } else if (t.oneToFiveAvg >= .55) {
-      likelihood += 8; reasons.push('A large share of active members make only 1–5 attacks.');
-    }
-
-    if (t.hitsPerHour >= 70 && strong && t.overlapRatio >= .35) {
-      likelihood -= 8; reasons.push(`High sustained fighting intensity (${Math.round(t.hitsPerHour)} recorded attacks/hour).`);
-    }
-
-    likelihood=Math.max(0,Math.min(100,Math.round(likelihood)));
-    return {
-      available:true,
-      likelihood,
-      confidence: sampled ? (strong && t.events>=30 ? 'MEDIUM' : 'LOW') : (strong && t.events>=40 ? 'HIGH' : t.events>=15 ? 'MEDIUM' : 'LOW'),
-      reasons:reasons.slice(0,8),
-      features:t
-    };
-  }
-
-  function termOverrideKey(warId) { return `termOverride:${warId}`; }
-
-  function loadTermOverride(warId) {
-    const v = String(storageGet(termOverrideKey(warId), 'auto'));
-    return ['term','competitive'].includes(v) ? v : 'auto';
-  }
-
-  function saveTermOverride(warId, value) {
-    const v = ['term','competitive'].includes(value) ? value : 'auto';
-    if (v === 'auto') storageSet(termOverrideKey(warId), 'auto');
-    else storageSet(termOverrideKey(warId), v);
-    return v;
-  }
-
-  function applyTermOverride(report, autoResult) {
-    const override = loadTermOverride(report?.id);
-    if (override === 'term') {
-      return {
-        ...(autoResult || {}),
-        available:true, likelihood:100, label:'KNOWN TERMED • MANUAL', tone:'red',
-        source:'manual', confidence:'MANUAL', override:'term',
-        reasons:['Manually marked as a known termed war. Automatic graph/report result is bypassed until AUTO is selected.']
-      };
-    }
-    if (override === 'competitive') {
-      return {
-        ...(autoResult || {}),
-        available:true, likelihood:0, label:'KNOWN COMPETITIVE • MANUAL', tone:'green',
-        source:'manual', confidence:'MANUAL', override:'competitive',
-        reasons:['Manually marked as a known competitive war. Automatic graph/report result is bypassed until AUTO is selected.']
-      };
-    }
-    if (autoResult) autoResult.override = 'auto';
-    return autoResult;
   }
 
   function normalizeGraphTime(v) {
@@ -1136,159 +938,6 @@
     return candidates[0] || {points:[],source:'none',score:-1};
   }
 
-
-  function extractGraphPointsFromObject(root) {
-    const candidates = [];
-    let visited = 0;
-
-    function add(points, source) {
-      const cleaned = cleanGraphPoints(points);
-      const score = graphCandidateScore(cleaned);
-      if (score >= 0) candidates.push({points:cleaned, source, score});
-    }
-
-    function rowToPoint(row) {
-      if (!row) return null;
-      if (Array.isArray(row) && row.length >= 3) {
-        return {t:row[0], a:row[1], b:row[2]};
-      }
-      if (typeof row !== 'object') return null;
-      const t = row.t ?? row.time ?? row.timestamp ?? row.x ?? row.date ?? row.ts;
-      const a = row.a ?? row.score1 ?? row.y1 ?? row.home ?? row.left ?? row.faction1 ?? row.score_a ?? row.first;
-      const b = row.b ?? row.score2 ?? row.y2 ?? row.away ?? row.right ?? row.faction2 ?? row.score_b ?? row.second;
-      if (t == null || a == null || b == null) return null;
-      return {t,a,b};
-    }
-
-    function walk(value, depth=0, path='root') {
-      if (visited++ > 30000 || depth > 9 || value == null) return;
-
-      if (Array.isArray(value)) {
-        if (value.length >= 6) {
-          const rows = value.map(rowToPoint).filter(Boolean);
-          if (rows.length >= 6) add(rows, `json:${path}`);
-        }
-        for (let i=0; i<Math.min(value.length, 300); i++) walk(value[i], depth+1, `${path}[${i}]`);
-        return;
-      }
-
-      if (typeof value !== 'object') return;
-
-      // Common chart layouts: {timestamps:[...], series:[{data:[...]},{data:[...]}]}
-      const times = value.timestamps || value.times || value.labels || value.x || value.time;
-      const series = value.series || value.datasets || value.lines;
-      if (Array.isArray(times) && Array.isArray(series) && series.length >= 2) {
-        const s1 = series[0]?.data || series[0]?.values || series[0];
-        const s2 = series[1]?.data || series[1]?.values || series[1];
-        if (Array.isArray(s1) && Array.isArray(s2)) {
-          const n = Math.min(times.length, s1.length, s2.length);
-          const pts = [];
-          for (let i=0;i<n;i++) {
-            const a = typeof s1[i] === 'object' ? (s1[i]?.y ?? s1[i]?.value ?? s1[i]?.score) : s1[i];
-            const b = typeof s2[i] === 'object' ? (s2[i]?.y ?? s2[i]?.value ?? s2[i]?.score) : s2[i];
-            const t = typeof times[i] === 'object' ? (times[i]?.x ?? times[i]?.time ?? times[i]?.timestamp) : times[i];
-            pts.push({t,a,b});
-          }
-          if (pts.length >= 6) add(pts, `json-series:${path}`);
-        }
-      }
-
-      for (const [k,v] of Object.entries(value)) {
-        if (typeof v === 'function') continue;
-        walk(v, depth+1, `${path}.${k}`);
-      }
-    }
-
-    try { walk(root); } catch (_) {}
-    candidates.sort((a,b)=>b.score-a.score);
-    return candidates[0] || {points:[], source:'none', score:-1};
-  }
-
-  async function renderedWarGraphAnalysis(warId) {
-    return new Promise((resolve) => {
-      const iframe = document.createElement('iframe');
-      let finished = false;
-      let timer = null;
-
-      const finish = (result) => {
-        if (finished) return;
-        finished = true;
-        clearTimeout(timer);
-        try { iframe.remove(); } catch (_) {}
-        resolve(result || {points:[],source:'rendered-none',score:-1});
-      };
-
-      iframe.setAttribute('aria-hidden', 'true');
-      iframe.style.cssText = 'position:fixed!important;left:-1200px!important;top:0!important;width:900px!important;height:700px!important;opacity:.01!important;pointer-events:none!important;z-index:-9999!important;border:0!important;';
-      iframe.src = `/war.php?step=rankreport&rankID=${encodeURIComponent(warId)}&wrathGraphScan=${Date.now()}`;
-
-      iframe.onload = async () => {
-        try {
-          // Let Torn's page JS finish building the historical graph.
-          for (let pass=0; pass<5; pass++) {
-            await sleep(pass === 0 ? 1200 : 700);
-            const doc = iframe.contentDocument;
-            if (!doc) continue;
-
-            const html = doc.documentElement?.outerHTML || '';
-            const fromHtml = extractGraphPointsFromHtml(html);
-            if (fromHtml.points?.length >= 6) return finish({...fromHtml, source:`rendered-${fromHtml.source}`});
-
-            // Some chart libraries leave useful data objects directly on DOM nodes.
-            const attrs = [];
-            for (const el of Array.from(doc.querySelectorAll('[data-series],[data-points],[data-chart],[data-graph],[data-score]')).slice(0,100)) {
-              for (const a of Array.from(el.attributes || [])) {
-                if (/series|points|chart|graph|score|data/i.test(a.name)) attrs.push(a.value);
-              }
-            }
-            for (const raw of attrs) {
-              try {
-                const obj = JSON.parse(raw);
-                const fromObj = extractGraphPointsFromObject(obj);
-                if (fromObj.points?.length >= 6) return finish({...fromObj, source:`rendered-${fromObj.source}`});
-              } catch (_) {}
-            }
-          }
-
-          // Inspect resources the rendered report requested. This often reveals the
-          // JSON/AJAX endpoint used by the graph even when the HTML itself has no points.
-          const win = iframe.contentWindow;
-          const urls = Array.from(win?.performance?.getEntriesByType?.('resource') || [])
-            .map(e => e?.name).filter(Boolean)
-            .filter(u => {
-              try {
-                const x = new URL(u, location.href);
-                if (x.origin !== location.origin) return false;
-                return /war|rank|report|graph|score|ajax/i.test(x.href);
-              } catch (_) { return false; }
-            })
-            .slice(0,24);
-
-          for (const u of urls) {
-            try {
-              const r = await fetch(u, {credentials:'include', cache:'no-store'});
-              if (!r.ok) continue;
-              const txt = await r.text();
-
-              const h = extractGraphPointsFromHtml(txt);
-              if (h.points?.length >= 6) return finish({...h, source:`resource-${h.source}`});
-
-              try {
-                const obj = JSON.parse(txt);
-                const j = extractGraphPointsFromObject(obj);
-                if (j.points?.length >= 6) return finish({...j, source:`resource-${j.source}`});
-              } catch (_) {}
-            } catch (_) {}
-          }
-        } catch (_) {}
-        finish({points:[], source:'rendered-none', score:-1});
-      };
-
-      timer = setTimeout(() => finish({points:[],source:'rendered-timeout',score:-1}), FAST_GRAPH_FALLBACK_DELAY_MS);
-      (document.body || document.documentElement).appendChild(iframe);
-    });
-  }
-
   function classifyTermGraph(points, report) {
     const p = cleanGraphPoints(points);
     if (p.length < 6) return {
@@ -1433,59 +1082,49 @@
     const hitsPerHour = durationHours > 0 ? totalHits/durationHours : 0;
     const hitsPerMemberHour = durationHours > 0 && (aCount+bCount)>0 ? totalHits/((aCount+bCount)*durationHours) : 0;
 
-    // REPORT ESTIMATE: intentionally biased toward flagging suspicious wars rather than
-    // declaring broad participation/balanced hit totals "competitive". Termed wars can
-    // still have both factions farming participation and rewards.
-    let likelihood = 42;
+    // This is intentionally a conservative fallback. It estimates whether the completed
+    // report LOOKS like a low-competition / arranged-style war; it cannot prove terms.
+    let likelihood = 38;
     const reasons = [];
 
-    if (loserRatio >= .15 && loserRatio <= .42) {
-      likelihood += 22; reasons.push(`Final loser/winner score ratio (${Math.round(loserRatio*100)}%) looks like a controlled losing cap.`);
-    } else if (loserRatio > .42 && loserRatio <= .62) {
-      likelihood += 10; reasons.push(`Mid-range losing score (${Math.round(loserRatio*100)}%) can fit capped/termed scoring.`);
+    if (loserRatio >= .18 && loserRatio <= .38) {
+      likelihood += 18; reasons.push(`Final score ratio (${Math.round(loserRatio*100)}%) sits in a common controlled-loss band.`);
+    } else if (loserRatio > .60) {
+      likelihood -= 19; reasons.push(`Close final score ratio (${Math.round(loserRatio*100)}%) looks more competitive.`);
     } else if (loserRatio < .10 && hiScore > 0) {
-      likelihood += 18; reasons.push('Extremely one-sided score is compatible with a rollover/stomp-style term.');
-    } else if (loserRatio >= .78) {
-      likelihood -= 16; reasons.push(`Very close final score (${Math.round(loserRatio*100)}%) is stronger competitive evidence.`);
+      likelihood += 7; reasons.push('Extremely one-sided final score can indicate a roll-over or arranged loss.');
     }
 
-    if (durationHours >= 16) {
-      likelihood += 13; reasons.push(`Long ${durationHours.toFixed(1)}h duration increases term suspicion.`);
-    } else if (durationHours >= 8) {
-      likelihood += 7; reasons.push(`War lasted ${durationHours.toFixed(1)}h without resolving quickly.`);
-    } else if (durationHours <= 2 && loserRatio >= .65) {
-      likelihood -= 10; reasons.push('Short, close war looks more like a hard push than passive terms.');
+    if (durationHours >= 10 && hitsPerMemberHour > 0 && hitsPerMemberHour < .12) {
+      likelihood += 17; reasons.push(`Low fighting density across ${durationHours.toFixed(1)}h.`);
+    } else if (durationHours >= 6 && hitsPerMemberHour > 0 && hitsPerMemberHour < .20) {
+      likelihood += 9; reasons.push('Relatively light hit density for the war duration.');
+    } else if (hitsPerMemberHour >= .45) {
+      likelihood -= 15; reasons.push('High hit density looks more like sustained competition.');
     }
 
-    if (durationHours >= 6 && hitsPerMemberHour > 0 && hitsPerMemberHour < .14) {
-      likelihood += 17; reasons.push('Low fighting density for the number of members and war length.');
-    } else if (durationHours >= 6 && hitsPerMemberHour > 0 && hitsPerMemberHour < .24) {
-      likelihood += 9; reasons.push('Relatively light sustained fighting density.');
-    } else if (hitsPerMemberHour >= .70 && loserRatio >= .70) {
-      likelihood -= 10; reasons.push('Very high hit density plus a close score is strong competitive evidence.');
+    if (aCount && bCount) {
+      if (bothParticipation < .35) {
+        likelihood += 16; reasons.push(`Only ${Math.round(bothParticipation*100)}% average roster participation.`);
+      } else if (bothParticipation >= .60) {
+        likelihood -= 13; reasons.push(`Broad roster participation (${Math.round(bothParticipation*100)}%) looks more competitive.`);
+      }
+      if (participationBalance < .45 && Math.max(aPart,bPart) >= .35) {
+        likelihood += 8; reasons.push('Participation is heavily one-sided.');
+      }
     }
 
-    if (aCount && bCount && bothParticipation < .35) {
-      likelihood += 15; reasons.push(`Only ${Math.round(bothParticipation*100)}% average roster participation.`);
-    }
-    if (aCount && bCount && participationBalance < .40 && Math.max(aPart,bPart) >= .35) {
-      likelihood += 9; reasons.push('Roster participation is heavily one-sided.');
-    }
-
-    if (totalHits > 0 && hitBalance < .22) {
-      likelihood += 12; reasons.push('Successful attack production is extremely one-sided.');
+    if (totalHits > 0) {
+      if (hitBalance < .25) {
+        likelihood += 10; reasons.push('Hit production is extremely one-sided.');
+      } else if (hitBalance > .65) {
+        likelihood -= 8; reasons.push('Both factions produced a fairly similar number of attacks.');
+      }
     }
 
-    // A stomp with meaningful participation on both sides can still be a deliberate
-    // rollover; don't let "lots of hits" automatically erase the signal.
-    if (loserRatio < .28 && bothParticipation >= .45 && totalHits >= 100) {
-      likelihood += 8; reasons.push('One-sided score despite meaningful participation resembles a controlled rollover.');
+    if (durationHours > 0 && durationHours < 1.5 && loserRatio > .45) {
+      likelihood -= 8; reasons.push('Short, close-scoring war is less consistent with a passive term pattern.');
     }
-
-    // Balanced hit totals / broad participation are informational, not automatic
-    // competitive deductions, because termed wars often farm participation on both sides.
-    if (hitBalance >= .65) reasons.push('Both factions produced similar successful-hit totals; this does not rule out terms.');
-    if (bothParticipation >= .60) reasons.push(`Broad roster participation (${Math.round(bothParticipation*100)}%) does not rule out terms.`);
 
     likelihood = Math.max(5, Math.min(95, Math.round(likelihood)));
     let label='LIKELY COMPETITIVE • REPORT EST.', tone='green';
@@ -1500,7 +1139,7 @@
       source:'report-fallback',
       points:0,
       confidence:'ESTIMATE',
-      reasons: reasons.length ? reasons.slice(0,6) : ['Completed report did not show a strong term-like or competitive pattern.'],
+      reasons: reasons.length ? reasons.slice(0,5) : ['Completed report did not show a strong term-like or competitive pattern.'],
       features:{
         durationHours, loserRatio, hitBalance, hitsPerHour, hitsPerMemberHour,
         targetParticipation:aPart, otherParticipation:bPart, participationBalance,
@@ -1509,207 +1148,38 @@
     };
   }
 
-
-  function timelineStrongEnoughToSkipGraph(timelineEvidence) {
-    if (!timelineEvidence?.available) return false;
-    const t = timelineEvidence.features || {};
-    const sampled = !!t.sampled;
-    const enoughEvents = num(t.events) >= (sampled ? 30 : 20);
-    const clearHigh = num(timelineEvidence.likelihood) >= (sampled ? 80 : 70);
-    const clearLow = num(timelineEvidence.likelihood) <= (sampled ? 20 : 30);
-    const decentCoverage = t.bothSides || num(t.events) >= (sampled ? 70 : 50);
-    return enoughEvents && decentCoverage && (clearHigh || clearLow);
-  }
-
-  function reportStrongEnoughToSkipGraph(reportEstimate) {
-    if (!reportEstimate?.available) return false;
-    const p = num(reportEstimate.likelihood, 50);
-    return p >= 80 || p <= 20;
-  }
-
-  function combineTermEvidence(report, graphOrReport, timelineEvidence) {
-    const base = graphOrReport || classifyTermFromReport(report);
-    const tl = timelineEvidence;
-
-    let likelihood = num(base?.likelihood, 50);
-    let source = base?.source || 'report-fallback';
-    let confidence = base?.confidence || (source==='report-fallback'?'LOW':'MEDIUM');
-    const reasons=[];
-
-    if (tl?.available) {
-      // Exact timestamps are the strongest evidence. Weight them more heavily when
-      // both factions appear in the detailed faction attack history.
-      const sampled = !!tl.features?.sampled;
-      const timelineWeight = sampled
-        ? (tl.features?.bothSides ? .50 : .35)
-        : (tl.features?.bothSides ? .68 : .45);
-      likelihood = Math.round(num(tl.likelihood,50)*timelineWeight + num(base?.likelihood,50)*(1-timelineWeight));
-      source = source==='report-fallback' ? 'timeline+report' : 'timeline+graph';
-      confidence = sampled
-        ? (tl.confidence === 'MEDIUM' ? 'MEDIUM' : 'LOW')
-        : (tl.confidence === 'HIGH' && source==='timeline+graph' ? 'VERY HIGH' :
-           tl.confidence === 'HIGH' ? 'HIGH' :
-           tl.confidence === 'MEDIUM' ? 'MEDIUM' : 'LOW');
-      reasons.push(...(tl.reasons||[]).slice(0,5));
-      reasons.push(...(base?.reasons||[]).slice(0,3));
-    } else {
-      reasons.push(...(base?.reasons||[]).slice(0,7));
-      if (tl?.reasons?.[0]) reasons.unshift(tl.reasons[0]);
-    }
-
-    // Final score ratio is supporting evidence only, not the main detector.
-    const hi=Math.max(num(report?.targetScore),num(report?.otherScore));
-    const lo=Math.min(num(report?.targetScore),num(report?.otherScore));
-    const loserRatio=hi?lo/hi:0;
-    if (loserRatio>=.16 && loserRatio<=.38 && likelihood<55) {
-      likelihood=Math.min(100,likelihood+6);
-      reasons.push(`Final losing score sits at ${Math.round(loserRatio*100)}% of the winner — mild controlled-cap evidence.`);
-    }
-
-    likelihood=Math.max(0,Math.min(100,Math.round(likelihood)));
-    let label='LIKELY COMPETITIVE',tone='green';
-    if(likelihood>=75){label='VERY LIKELY TERM-LIKE';tone='red';}
-    else if(likelihood>=55){label='POSSIBLY TERM-LIKE';tone='orange';}
-    else if(likelihood>=45){label='BORDERLINE / UNCERTAIN';tone='yellow';}
-
-    return {
-      ...base,
-      available:true,
-      likelihood,
-      label,
-      tone,
-      source,
-      confidence,
-      reasons:Array.from(new Set(reasons)).slice(0,8),
-      timeline:tl?.features||null
-    };
-  }
-
-  async function fetchTermGraphAnalysis(report, force=false, progressCtx=null) {
+  async function fetchTermGraphAnalysis(report, force=false) {
     if (!force) {
       const cached = loadTermGraph(report.id);
-      if (cached && cached.source !== 'manual') {
-        if (progressCtx) setProgress(`${progressCtx} • classification cached`);
-        return applyTermOverride(report, cached);
-      }
+      if (cached) return cached;
     }
-
-    // FAST PATH 1: detailed attack timestamps first.
-    const timeline = await fetchOwnFactionWarTimeline(report, force, progressCtx);
-    const timelineEvidence = classifyTimelineEvidence(timeline, report);
-
-    // FAST PATH 2: completed report estimate is instant and gives context.
-    const reportBase = classifyTermFromReport(report);
-
-    // If timestamps are decisive, skip all graph work.
-    if (timelineStrongEnoughToSkipGraph(timelineEvidence)) {
-      if (progressCtx) setProgress(`${progressCtx} • timestamp result`);
-      const autoResult = combineTermEvidence(report, reportBase, timelineEvidence);
-      autoResult.fastPath = 'timestamps';
-      saveTermGraph(report.id, autoResult);
-      return applyTermOverride(report, autoResult);
-    }
-
-    // If timestamps are unavailable but the completed report is already decisive,
-    // use it immediately instead of opening the slow hidden report page.
-    if (!timelineEvidence?.available && reportStrongEnoughToSkipGraph(reportBase)) {
-      if (progressCtx) setProgress(`${progressCtx} • report result`);
-      const autoResult = combineTermEvidence(report, reportBase, timelineEvidence);
-      autoResult.fastPath = 'report';
-      saveTermGraph(report.id, autoResult);
-      return applyTermOverride(report, autoResult);
-    }
-
-    // AMBIGUOUS ONLY: cheap static graph read.
-    let graphBase = null;
-    let staticFailure = '';
-    if (progressCtx) setProgress(`${progressCtx} • checking graph`);
-
+    let result;
     try {
       const url = `/war.php?step=rankreport&rankID=${encodeURIComponent(report.id)}`;
       const r = await fetch(url, { credentials:'include', cache:'no-store' });
       if (!r.ok) throw new Error(`War graph HTTP ${r.status}`);
       const html = await r.text();
       const extracted = extractGraphPointsFromHtml(html);
-      if (extracted.points?.length >= 6) {
-        graphBase = classifyTermGraph(extracted.points, report);
-        graphBase.source = extracted.source;
-        graphBase.confidence = 'GRAPH';
-      } else {
-        staticFailure = 'Static report HTML had no readable graph series.';
+      result = classifyTermGraph(extracted.points, report);
+      result.source = extracted.source;
+      if (!result.available) {
+        result = classifyTermFromReport(report);
+        result.reasons.unshift('Historical graph series was not readable in TornPDA; using completed-report fallback.');
       }
     } catch (e) {
-      staticFailure = e?.message || 'static graph read failed';
+      result = classifyTermFromReport(report);
+      result.reasons.unshift(`Graph read unavailable (${e?.message || 'unknown error'}); using completed-report fallback.`);
     }
-
-    // Deep graph rendering is now last resort only.
-    if (!graphBase?.available) {
-      const ambiguous = (
-        (timelineEvidence?.available && num(timelineEvidence.likelihood) > 30 && num(timelineEvidence.likelihood) < 70) ||
-        (!timelineEvidence?.available && num(reportBase.likelihood) > 20 && num(reportBase.likelihood) < 80)
-      );
-
-      if (ambiguous) {
-        if (progressCtx) setProgress(`${progressCtx} • deep graph check`);
-        try {
-          const rendered = await renderedWarGraphAnalysis(report.id);
-          if (rendered.points?.length >= 6) {
-            graphBase = classifyTermGraph(rendered.points, report);
-            graphBase.source = rendered.source;
-            graphBase.confidence = 'GRAPH';
-            graphBase.reasons.unshift('Graph captured from Torn’s fully rendered ranked-war report.');
-          }
-        } catch (_) {}
-      }
-    }
-
-    if (!graphBase?.available) {
-      graphBase = reportBase;
-      graphBase.reasons.unshift(`Graph not needed/readable${staticFailure?` (${staticFailure})`:''}; using fast report evidence.`);
-    }
-
-    const autoResult = combineTermEvidence(report, graphBase, timelineEvidence);
-    autoResult.fastPath = graphBase === reportBase ? 'timeline+report' : 'timeline+graph';
-    saveTermGraph(report.id, autoResult);
-    return applyTermOverride(report, autoResult);
-  }
-
-  function guaranteedWarClassification(report) {
-    let auto = report?.termGraph;
-
-    // Strip a prior manual overlay so AUTO can restore the underlying automatic result.
-    if (auto?.source === 'manual') auto = loadTermGraph(report?.id);
-
-    if (!auto?.available || !Number.isFinite(Number(auto?.likelihood))) {
-      try {
-        const base = classifyTermFromReport(report || {});
-        auto = combineTermEvidence(report || {}, base, {available:false,reasons:['Detailed timestamp timeline has not been scanned yet.']});
-      } catch (_) {
-        auto = {
-          available:true, likelihood:50, label:'BORDERLINE • REPORT EST.',
-          tone:'yellow', source:'report-fallback', points:0, confidence:'LOW ESTIMATE',
-          reasons:['Graph/detail signals were limited; using a neutral report estimate.'],
-          features:{fallback:true}
-        };
-      }
-      try { saveTermGraph(report?.id, auto); } catch (_) {}
-    }
-
-    auto.available = true;
-    auto.likelihood = Math.max(0, Math.min(100, Math.round(Number(auto.likelihood) || 50)));
-
-    const resolved = applyTermOverride(report, auto);
-    report.termGraph = resolved;
-    return resolved;
+    saveTermGraph(report.id, result);
+    return result;
   }
 
   function applyWarTypeFilter() {
     const all = state.loadedReports || [];
-    all.forEach(r => guaranteedWarClassification(r));
     if (state.warTypeFilter === 'term') {
-      state.reports = all.filter(r => num(guaranteedWarClassification(r).likelihood) >= 55);
+      state.reports = all.filter(r => r.termGraph?.available && num(r.termGraph.likelihood) >= 55);
     } else if (state.warTypeFilter === 'competitive') {
-      state.reports = all.filter(r => num(guaranteedWarClassification(r).likelihood) < 55);
+      state.reports = all.filter(r => r.termGraph?.available && num(r.termGraph.likelihood) < 55);
     } else {
       state.reports = all.slice();
     }
@@ -1717,12 +1187,11 @@
 
   function termSummary() {
     const all = state.loadedReports || [];
-    all.forEach(r => guaranteedWarClassification(r));
-    const known = all.slice();
-    const term = known.filter(r=>num(r.termGraph?.likelihood)>=55);
-    const very = known.filter(r=>num(r.termGraph?.likelihood)>=75);
-    const competitive = known.filter(r=>num(r.termGraph?.likelihood)<55);
-    const unknown = 0;
+    const known = all.filter(r=>r.termGraph?.available);
+    const term = known.filter(r=>num(r.termGraph.likelihood)>=55);
+    const very = known.filter(r=>num(r.termGraph.likelihood)>=75);
+    const competitive = known.filter(r=>num(r.termGraph.likelihood)<55);
+    const unknown = all.length-known.length;
     return {
       all:all.length, known:known.length, term:term.length, very:very.length,
       competitive:competitive.length, unknown,
@@ -1745,9 +1214,7 @@
       id: r.id, start: r.start, end: r.end, result: r.result,
       targetScore: r.targetScore, otherScore: r.otherScore,
       opponentId: r.opponentId, opponentName: r.opponentName,
-      targetAttacks: r.targetAttacks, otherAttacks: r.otherAttacks,
-      targetMemberCount: r.targetMemberCount, otherMemberCount: r.otherMemberCount,
-      members: r.members, opponentMembers: r.opponentMembers,
+      members: r.members,
     }));
   }
 
@@ -1968,7 +1435,8 @@
       const errors = [];
       let graphMissing = 0;
       for (let i = 0; i < wars.length; i++) {
-        setProgress(`War ${i + 1}/${wars.length} • preparing`);
+        state.progress = `Reading selected war ${i + 1} / ${wars.length}`;
+        render();
         try {
           let report = !force ? loadReportByWar(state.targetId, wars[i].id) : null;
           if (!report) {
@@ -1976,14 +1444,14 @@
             if (report) saveReportByWar(state.targetId, wars[i].id, report);
           }
           if (report) {
-            setProgress(`War ${i + 1}/${wars.length} • fast hybrid scan`);
-            report.termGraph = await fetchTermGraphAnalysis(report, force, `War ${i + 1}/${wars.length}`);
+            state.progress = `War ${i + 1}/${wars.length} • reading graph pattern`;
+            render();
+            report.termGraph = await fetchTermGraphAnalysis(report, force);
             if (!report.termGraph?.available) graphMissing++;
-            guaranteedWarClassification(report);
             reports.push(report);
           }
         } catch (e) { errors.push(e?.message || String(e)); }
-        await sleep(35);
+        await sleep(160);
       }
 
       state.loadedReports = reports.sort((a,b)=>(b.end||b.start)-(a.end||a.start));
@@ -1993,7 +1461,7 @@
       const notices = [];
       if (errors.length) notices.push(`${reports.length}/${wars.length} selected war reports loaded; ${errors.length} unavailable.`);
       if (graphMissing) notices.push(`${graphMissing} war classification${graphMissing===1?'':'s'} could not be completed.`);
-      if (state.warTypeFilter !== 'all' && !state.reports.length && reports.length) notices.push('No selected wars fall into the current WAR TYPE bucket.');
+      if (state.warTypeFilter !== 'all' && !state.reports.length && reports.length) notices.push('No loaded wars match the current WAR TYPE filter.');
       state.warning = notices.join(' ');
       const filterName = state.warTypeFilter === 'term' ? 'TERM-LIKE' : state.warTypeFilter === 'competitive' ? 'COMPETITIVE-LIKE' : 'ALL';
       state.progress = `${state.reports.length}/${reports.length} wars • ${filterName}`;
@@ -2231,7 +1699,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 .pwi-warchoice-main{flex:1;min-width:0}.pwi-warchoice-main b{display:block;font-size:10px;color:#fff}.pwi-warchoice-main span{display:block;font-size:9px;color:#91a397;margin-top:2px}
 .pwi-warselect-summary{font-size:10px;color:#b9c7bd;margin:5px 0}
 .pwi-warfilter{display:flex;gap:5px;align-items:center;padding:5px 7px;background:#0e1511;border-top:1px solid #1e2a22;border-bottom:1px solid #29372e;overflow-x:auto;scrollbar-width:none;flex:0 0 auto}.pwi-warfilter::-webkit-scrollbar{display:none}.pwi-warfilter>span{font-size:9px;font-weight:900;color:#8fa095;white-space:nowrap}.pwi-warfilter .pwi-btn.active{background:#263b2d;border-color:#659071;color:#9cffab}
-.pwi-termwar{background:#101611;border:1px solid #29382f;border-radius:8px;padding:7px;margin-top:6px}.pwi-term-actions{display:flex;gap:5px;flex-wrap:wrap;margin-top:7px}.pwi-term-actions .pwi-btn{font-size:9px;padding:5px 7px;min-height:29px}.pwi-term-actions .pwi-btn.active{border-color:#79c98c!important;color:#9effae!important;background:#1e3526!important}.pwi-termwar-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.pwi-termwar-name{font-size:10px;font-weight:900;color:#fff;flex:1;min-width:160px}.pwi-termwar-meta{font-size:9px;color:#9fb0a5;margin-top:4px;line-height:1.35}.pwi-term-reasons{font-size:9px;color:#b8c6bd;margin-top:4px}.pwi-warchoice .pwi-term-mini{margin-left:auto;flex:0 0 auto}
+.pwi-termwar{background:#101611;border:1px solid #29382f;border-radius:8px;padding:7px;margin-top:6px}.pwi-termwar-top{display:flex;align-items:center;gap:6px;flex-wrap:wrap}.pwi-termwar-name{font-size:10px;font-weight:900;color:#fff;flex:1;min-width:160px}.pwi-termwar-meta{font-size:9px;color:#9fb0a5;margin-top:4px;line-height:1.35}.pwi-term-reasons{font-size:9px;color:#b8c6bd;margin-top:4px}.pwi-warchoice .pwi-term-mini{margin-left:auto;flex:0 0 auto}
 
 .pwi-keybox{padding:14px}.pwi-keybox input{width:100%;background:#090d0a;color:#fff;border:1px solid #44584a;border-radius:8px;padding:10px;margin:9px 0}.pwi-keynote{font-size:10px;color:#93a399;line-height:1.45}
 
@@ -2277,145 +1745,50 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       b.title = 'WRATH War Intelligence';
       b.setAttribute('aria-label', 'Open WRATH War Intelligence');
       b.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-
-        // Launcher and scanner are deliberately separated.
-        // Opening/closing the panel must never remount or rebuild the launcher.
+        e?.preventDefault?.();
+        e?.stopPropagation?.();
         state.open = !state.open;
         render();
-
-        // Let the panel paint first. Only then wake the scanner.
-        if (state.open && state.apiKey && !state.loading && !state.analyzing) {
-          setTimeout(() => {
-            if (state.open && state.apiKey && !state.loading && !state.analyzing) {
-              scanBase({ analyze: true, forceHistory: false }).catch(() => {});
-            }
-          }, 120);
-        }
+        // SAFE CORE: opening the board never starts API/history/deep scanning.
+        // Press SCAN or DEEP TERM SCAN manually.
       });
     }
     return b;
   }
 
-  function headerCleanText(el) {
-    return String(el?.textContent || '').replace(/\s+/g, ' ').trim();
+  function headerCandidateText(el) {
+    if (!el) return '';
+    return [
+      el.textContent || '',
+      el.className || '',
+      el.id || '',
+      el.getAttribute?.('title') || '',
+      el.getAttribute?.('aria-label') || '',
+      el.getAttribute?.('alt') || '',
+      String(el.innerHTML || '').slice(0, 180)
+    ].join(' ').toLowerCase();
   }
 
-  function headerVisibleRect(el) {
-    if (!el || !el.getBoundingClientRect) return null;
-    const r = el.getBoundingClientRect();
-    if (!r || r.width < 4 || r.height < 4) return null;
-    const style = window.getComputedStyle(el);
-    if (style.display === 'none' || style.visibility === 'hidden' || Number(style.opacity || 1) === 0) return null;
-    return r;
-  }
-
-  function looksLikeMoneyPointsMeritsRow(el) {
-    const text = headerCleanText(el);
-    const rect = headerVisibleRect(el);
-    const cls = String(el?.className || '');
-
-    if (!rect || rect.width < 250 || rect.height < 20 || rect.height > 55) return false;
-
-    // Current Torn/TornPDA resource row can expose hidden accessibility text such as:
-    // Money:$27.6M Points:115 Merits:4
-    const hasMoneyWords =
-      text.includes('Money:') &&
-      text.includes('Points:') &&
-      text.includes('Merits:');
-
-    const hasMoneySymbols =
-      text.includes('$') &&
-      (text.includes('Points') || /\bP\b/.test(text)) &&
-      (text.includes('Merits') || text.includes('★') || text.includes('⭐'));
-
-    const knownResourceClass =
-      cls.includes('swiperWrapper') ||
-      cls.includes('user-information-mobile') ||
-      cls.includes('userInformation') ||
-      cls.includes('user-info');
-
-    return (hasMoneyWords || hasMoneySymbols) &&
-      (knownResourceClass || rect.top > 80);
-  }
-
-  function findTornResourceRow() {
-    // Exact current TornPDA money / points / merits row first.
-    const exact = Array.from(document.querySelectorAll('div')).find(looksLikeMoneyPointsMeritsRow);
-    if (exact) return exact;
-
-    // Broader fallback, still restricted to the resource row.
-    const maxTop = Math.max(650, window.innerHeight * 0.62);
-    const candidates = Array.from(document.querySelectorAll('div, ul, nav, section')).filter((el) => {
-      const rect = headerVisibleRect(el);
-      if (!rect || rect.width < 250 || rect.height < 20 || rect.height > 60) return false;
-      if (rect.top < 0 || rect.top > maxTop) return false;
-
-      const text = headerCleanText(el);
-      const hay = [
-        text,
-        String(el.className || ''),
-        String(el.id || ''),
-        String(el.getAttribute?.('aria-label') || ''),
-        String(el.innerHTML || '').slice(0, 300)
-      ].join(' ').toLowerCase();
-
-      const money = text.includes('$') || hay.includes('money');
-      const points = hay.includes('points') || /\bp\b/i.test(text);
-      const merits = hay.includes('merit') || text.includes('★') || text.includes('⭐');
-
-      return money && points && merits;
-    });
-
-    if (!candidates.length) return null;
-
-    candidates.sort((a, b) => {
-      const ar = headerVisibleRect(a);
-      const br = headerVisibleRect(b);
-      const at = headerCleanText(a);
-      const bt = headerCleanText(b);
-
-      const score = (el, rect, txt) =>
-        (txt.includes('Money:') ? 60 : 0) +
-        (txt.includes('Points:') ? 55 : 0) +
-        (txt.includes('Merits:') ? 55 : 0) +
-        (String(el.className || '').includes('swiperWrapper') ? 40 : 0) -
-        Math.abs((rect?.height || 30) - 30);
-
-      return score(b, br, bt) - score(a, ar, at);
-    });
-
-    return candidates[0];
-  }
-
-  function findGlobalHeaderGenderTarget() {
-    const nodes = Array.from(document.querySelectorAll('a, button, div, span, li, i, img, svg'));
+  function findTornHeaderGenderTarget() {
+    const nodes = Array.from(document.querySelectorAll('a,button,div,span,li,i,img,svg'));
     const candidates = [];
-    const maxTop = Math.max(650, window.innerHeight * 0.62);
 
     for (const el of nodes) {
       if (!el || el.id === `${UI}-btn` || el.closest?.(`#${UI}-panel`)) continue;
 
-      const r = headerVisibleRect(el);
-      if (!r) continue;
-      if (r.top < 0 || r.top > maxTop) continue;
-      if (r.width > 70 || r.height > 70 || r.width < 8 || r.height < 8) continue;
+      const r = el.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) continue;
 
-      const text = headerCleanText(el);
-      const hay = [
-        text,
-        String(el.className || ''),
-        String(el.id || ''),
-        String(el.getAttribute?.('title') || ''),
-        String(el.getAttribute?.('alt') || ''),
-        String(el.getAttribute?.('aria-label') || ''),
-        String(el.innerHTML || '').slice(0, 160)
-      ].join(' ').toLowerCase();
+      // Keep this search in Torn's upper header/resource area.
+      if (r.top < -5 || r.top > 340) continue;
+      if (r.left < window.innerWidth * 0.20) continue;
+
+      const hay = headerCandidateText(el);
+      const textOnly = String(el.textContent || '').trim();
 
       const genderHit =
-        text.includes('♂') ||
-        text.includes('♀') ||
+        textOnly.includes('♂') ||
+        textOnly.includes('♀') ||
         hay.includes('gender') ||
         hay.includes('male') ||
         hay.includes('female') ||
@@ -2424,18 +1797,14 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 
       if (!genderHit) continue;
 
-      let score =
-        ((text.includes('♂') || text.includes('♀')) ? 120 : 0) +
-        (hay.includes('gender') ? 90 : 0) +
-        (r.left > window.innerWidth * 0.25 ? 25 : 0) -
-        Math.abs(r.height - 24) -
-        Math.abs(r.width - 24);
-
-      // Extra preference when this icon is actually inside the money/points row.
-      if (el.closest && findTornResourceRow()) {
-        const row = findTornResourceRow();
-        if (row && row.contains(el)) score += 160;
-      }
+      let score = 0;
+      if (textOnly.includes('♂') || textOnly.includes('♀')) score += 140;
+      if (hay.includes('gender')) score += 100;
+      if (r.width >= 12 && r.width <= 50) score += 35;
+      if (r.height >= 12 && r.height <= 50) score += 35;
+      if (r.left > window.innerWidth * 0.45) score += 25;
+      score -= Math.abs(r.width - 24) * 0.4;
+      score -= Math.abs(r.height - 24) * 0.4;
 
       candidates.push({ el, score });
     }
@@ -2444,106 +1813,75 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
     return candidates[0]?.el || null;
   }
 
-  function findGenderInsertTarget(row) {
-    if (!row) return null;
+  function findTornHeaderResourceRow() {
+    // Fallback for header versions where the gender element has no useful label.
+    // Prefer compact flex-like rows in the top-right containing Torn resource items.
+    const rows = Array.from(document.querySelectorAll(
+      'header, [class*="header"], [id*="header"], [class*="resource"], [class*="status"]'
+    ));
+    const candidates = [];
 
-    const all = Array.from(row.querySelectorAll('a, div, span, li, i, img, button, svg'));
+    for (const root of rows) {
+      const r = root.getBoundingClientRect?.();
+      if (!r || r.width <= 0 || r.height <= 0) continue;
+      if (r.top < -5 || r.top > 340) continue;
 
-    let target = all.find((el) => {
-      const text = headerCleanText(el);
-      const cls = String(el.className || '').toLowerCase();
-      const title = String(el.getAttribute?.('title') || '').toLowerCase();
-      const alt = String(el.getAttribute?.('alt') || '').toLowerCase();
-      const aria = String(el.getAttribute?.('aria-label') || '').toLowerCase();
-      const html = String(el.innerHTML || '').toLowerCase();
+      const children = Array.from(root.children || []);
+      if (children.length < 2) continue;
 
-      return (
-        text.includes('♂') ||
-        text.includes('♀') ||
-        cls.includes('gender') ||
-        title.includes('gender') ||
-        alt.includes('gender') ||
-        aria.includes('gender') ||
-        html.includes('male') ||
-        html.includes('female')
-      );
-    });
+      const hay = headerCandidateText(root);
+      let score = 0;
+      if (hay.includes('point')) score += 50;
+      if (hay.includes('merit')) score += 45;
+      if (hay.includes('money') || hay.includes('cash')) score += 30;
+      if (hay.includes('gender') || hay.includes('male') || hay.includes('female')) score += 60;
+      if (r.left > window.innerWidth * 0.25) score += 20;
+      if (r.height <= 80) score += 20;
 
-    if (target) return target;
+      if (score > 0) candidates.push({ el: root, score });
+    }
 
-    // If Torn hides the gender semantics, use merits/star as the stable neighbor.
-    target = all.find((el) => {
-      const text = headerCleanText(el);
-      const hay = [
-        String(el.className || ''),
-        String(el.getAttribute?.('title') || ''),
-        String(el.getAttribute?.('alt') || ''),
-        String(el.getAttribute?.('aria-label') || '')
-      ].join(' ').toLowerCase();
-
-      return (
-        text.includes('★') ||
-        text.includes('⭐') ||
-        hay.includes('merit')
-      );
-    });
-
-    return target || null;
+    candidates.sort((a, b) => b.score - a.score);
+    return candidates[0]?.el || null;
   }
 
   function mountLauncherInTornHeader() {
     const b = makeLauncherButton();
 
-    // If our icon is still mounted in the exact resource row, never move it.
-    if (
-      b.isConnected &&
-      !b.classList.contains('pwi-header-hidden') &&
-      lockedHeaderParent?.isConnected &&
-      b.parentElement === lockedHeaderParent
-    ) {
+    // If Torn has not destroyed the header we originally mounted into, do nothing.
+    // This is the key anti-jump rule: never rescan/reposition a live icon.
+    if (b.isConnected && !b.classList.contains('pwi-header-hidden') &&
+        lockedHeaderParent?.isConnected && b.parentElement === lockedHeaderParent) {
       return true;
     }
 
+    // The old Torn header was actually replaced; only now are we allowed to find a new slot.
     lockedHeaderParent = null;
     lockedHeaderAnchor = null;
 
-    // Best current path: direct globally visible gender icon.
-    const globalGender = findGlobalHeaderGenderTarget();
-    if (globalGender?.parentElement) {
-      globalGender.insertAdjacentElement('afterend', b);
-      lockedHeaderAnchor = globalGender;
-      lockedHeaderParent = b.parentElement;
+    const gender = findTornHeaderGenderTarget();
+    if (gender?.parentElement) {
+      lockedHeaderAnchor = gender;
+      lockedHeaderParent = gender.parentElement;
+      gender.insertAdjacentElement('afterend', b);
       b.classList.remove('pwi-header-hidden');
       return true;
     }
 
-    // Exact points-system row, matching the banker/points setup.
-    const row = findTornResourceRow();
-    const target = row ? findGenderInsertTarget(row) : null;
-
-    if (target?.parentElement) {
-      target.insertAdjacentElement('afterend', b);
-      lockedHeaderAnchor = target;
-      lockedHeaderParent = b.parentElement;
-      b.classList.remove('pwi-header-hidden');
-      return true;
-    }
-
+    const row = findTornHeaderResourceRow();
     if (row) {
-      // Remain in the money / points / merits row even if Torn obscures gender.
-      row.appendChild(b);
       lockedHeaderParent = row;
+      row.appendChild(b);
       b.classList.remove('pwi-header-hidden');
       return true;
     }
 
-    // No lower-row or floating fallback. Wait until Torn's points row exists.
-    if (b.parentElement) b.remove();
+    if (!b.isConnected) document.body.appendChild(b);
     b.classList.add('pwi-header-hidden');
     return false;
   }
 
-  function ensureLauncher() {
+  function ensureUi() {
     injectCss();
     mountLauncherInTornHeader();
   }
@@ -2564,7 +1902,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
 
   function keyScreen() {
     return `<div id="${UI}-panel">
-      <div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">HISTORICAL RANKED-WAR ACTIVITY • INDEPENDENT LAUNCHER</div></div><button class="pwi-btn" data-act="close">✕</button></div>
+      <div class="pwi-head"><div class="pwi-titlewrap"><div class="pwi-title">🕵️ WRATH WAR INTEL • v${VERSION}</div><div class="pwi-sub">HISTORICAL RANKED-WAR ACTIVITY</div></div><button class="pwi-btn" data-act="close">✕</button></div>
       <div class="pwi-keybox">
         <h3 style="color:#82ff95;margin:0 0 6px">Torn API Key</h3>
         <div class="pwi-keynote">This script uses your key only to read Torn API data needed for your current/upcoming opponent and completed ranked-war reports. The key and cached analysis stay on this device and are not sent to any outside server.</div>
@@ -2589,8 +1927,8 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
         <div class="pwi-helpitem"><b>WAR PARTICIPATION</b><span>Percent of analyzed wars in which that player made at least one attack, among reports where they were listed.</span></div>
         <div class="pwi-helpitem"><b>AVG HITS/WAR</b><span>Average attacks across wars where they were listed, including zero-hit appearances.</span></div>
         <div class="pwi-helpitem"><b>EST. MIN ENERGY/WAR</b><span>Average recorded ranked-war attacks × 25 energy. This is a minimum/gross estimate, not exact net energy. Failed offensive attempts or assists may not be represented by the report, while Revitalize can restore attack energy.</span></div>
-        <div class="pwi-helpitem"><b>TERM-LIKE %</b><span>Hybrid detector. For wars involving your own faction it first tries detailed faction attack timestamps and analyzes overlapping 10-minute fighting windows, response/switch timing, long lulls, late winner-only activity, respect balance, and small per-member participation caps. It then combines that with Torn's historical graph when readable and the completed report. Enemy wars without timestamp access use graph/report evidence at lower confidence. MARK TERMED / MARK COMPETITIVE overrides AUTO for known wars.</span></div>
-        <div class="pwi-helpitem"><b>WAR TYPE FILTER</b><span>ALL uses every selected war. COMPETITIVE-LIKE uses classifications under 55%; TERM-LIKE uses 55%+. Manual known-war labels override the automatic percentage. Graph reads are preferred. If TornPDA cannot expose historical graph points, every loaded war is automatically classified from the completed report so it cannot disappear from both filters.</span></div>
+        <div class="pwi-helpitem"><b>TERM-LIKE %</b><span>SAFE CORE: the launcher and normal scanner use the known-working v3.6.1 path. Nothing scans at page startup. DEEP TERM SCAN is optional/manual and analyzes detailed own-faction attack timestamps when your API permissions allow it. Uses the historical war graph when TornPDA exposes it. If not, it falls back to the completed report (duration, final score ratio, both factions’ attack volume and participation). REPORT EST. is lower-confidence and is never proof that factions made an agreement.</span></div>
+        <div class="pwi-helpitem"><b>WAR TYPE FILTER</b><span>ALL uses every selected war. COMPETITIVE-LIKE uses classifications under 55%; TERM-LIKE uses 55%+. Graph reads are preferred, but completed-report estimates are included when TornPDA cannot expose historical graph points.</span></div>
         <div class="pwi-helpitem"><b>ACTIVITY SCORE</b><span>Our 0–100 comparison score combining participation, attack volume, and recent activity. It is not a Torn battle stat.</span></div>
         <div class="pwi-helpitem"><b>RECENT FORM</b><span>Compares roughly the newest three known wars with older known wars. Heating Up means recent attack volume has materially increased.</span></div>
       </div></div>
@@ -2617,22 +1955,13 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
         <div class="pwi-kpi"><span>WINS IN DATA</span><b>${state.reports.filter(r=>['W','L'].includes(r.result)).length ? `${Math.round(m.winPct)}%` : '—'}</b></div>
       </div>
     </div>
-    <div class="pwi-section"><h3>⚡ HYBRID TERM FAST SCAN</h3>
-      <p>This is a <b>term-like likelihood</b>, not proof of a deal. Fast Scan uses cached timestamps first, then the completed report, and only opens Torn's slower historical graph when the result is genuinely ambiguous.</p>
-      <div class="pwi-note"><b>FAST SCAN:</b> repeat scans reuse completed-war reports, timestamp timelines and classifications. Use <b>FORCE RESCAN</b> only when you intentionally want every selected war rebuilt from scratch.</div>
+    <div class="pwi-section"><h3>🧭 TERMED-WAR GRAPH SCAN</h3>
+      <p>This is a <b>term-like likelihood</b>, not proof of a deal. The scanner prefers the historical graph; when TornPDA cannot expose it, it uses a lower-confidence completed-report estimate so the filters still work.</p>
       <div class="pwi-badge-row"><span class="pwi-pill tone-orange">${ts.known?Math.round(ts.termRate):0}% TERM-LIKE OF CLASSIFIED</span><span class="pwi-pill tone-red">${ts.very} VERY LIKELY</span><span class="pwi-pill tone-grey">${ts.unknown} NO CLASSIFICATION</span></div>
       ${(state.loadedReports||[]).map(rep=>{
         const g=rep.termGraph||{available:false,label:'NO CLASSIFICATION',tone:'grey',reasons:['Graph not scanned yet.']};
         const pct=g.available?`${g.likelihood}%`:'—';
-        const ov=loadTermOverride(rep.id);
-        const tl=g.timeline||null;
-        const sourceLabel=g.source==='manual'?'MANUAL':
-          g.source==='timeline+graph'?'TIMESTAMPS + GRAPH':
-          g.source==='timeline+report'?'TIMESTAMPS + REPORT':
-          g.source==='report-fallback'?'REPORT EST.':
-          g.source&&g.source!=='none'?'GRAPH':'AUTO';
-        const timelineMeta=tl?` • ${tl.events} timed attacks${tl.truncated?' (sampled)':''} • overlap ${Math.round((tl.overlapRatio||0)*100)}% • longest lull ${tl.maxGapSeconds?Math.round(tl.maxGapSeconds/60)+'m':'—'} • final winner share ${Math.round((tl.finalWinnerShare||0)*100)}%`:'';
-        return `<div class="pwi-termwar"><div class="pwi-termwar-top"><div class="pwi-termwar-name">${esc(fmtDate(rep.end||rep.start))} • vs ${esc(rep.opponentName||'Opponent')} • #${esc(rep.id)}</div><span class="pwi-pill tone-${g.tone}">${pct} ${esc(g.label)}</span></div><div class="pwi-termwar-meta">${sourceLabel} • CONFIDENCE ${esc(g.confidence||'LOW')}${timelineMeta}</div><div class="pwi-term-reasons">${(g.reasons||[]).slice(0,6).map(x=>`• ${esc(x)}`).join('<br>')}</div><div class="pwi-term-actions"><button class="pwi-btn ${ov==='term'?'active':''}" data-termoverride="term" data-war="${esc(rep.id)}">MARK TERMED</button><button class="pwi-btn ${ov==='competitive'?'active':''}" data-termoverride="competitive" data-war="${esc(rep.id)}">MARK COMPETITIVE</button><button class="pwi-btn ${ov==='auto'?'active':''}" data-termoverride="auto" data-war="${esc(rep.id)}">AUTO</button></div></div>`;
+        return `<div class="pwi-termwar"><div class="pwi-termwar-top"><div class="pwi-termwar-name">${esc(fmtDate(rep.end||rep.start))} • vs ${esc(rep.opponentName||'Opponent')} • #${esc(rep.id)}</div><span class="pwi-pill tone-${g.tone}">${pct} ${esc(g.label)}</span></div><div class="pwi-termwar-meta">${g.available?(g.source==='manual-timestamps'?`TIMESTAMPS • CONFIDENCE ${esc(g.confidence||'MEDIUM')} • ${g.timeline?.events||0} events • overlap ${Math.round((g.timeline?.overlap||0)*100)}% • longest lull ${g.timeline?.maxGap?Math.round(g.timeline.maxGap/60)+'m':'—'}`:g.source==='report-fallback'?`REPORT EST. • ${fmtNum(g.features?.durationHours||0,1)}h • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}% • hit balance ${Math.round((g.features?.hitBalance||0)*100)}%`:`${g.points||0} graph points • ${fmtNum(g.features?.durationHours||0,1)}h graph span • lead changes ${g.features?.leadChanges??'—'} • loser ratio ${Math.round((g.features?.loserRatio||0)*100)}%`):`Classification unavailable (${esc(g.source||'none')}).`}</div><div class="pwi-term-reasons">${(g.reasons||[]).slice(0,3).map(x=>`• ${esc(x)}`).join('<br>')}</div></div>`;
       }).join('')}
     </div>
 
@@ -2757,14 +2086,13 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       <div class="pwi-scope"><button class="pwi-scopebtn ${state.scope==='own'?'active':''}" data-scope="own">🏠 MY FACTION</button><button class="pwi-scopebtn ${state.scope==='enemy'?'active':''}" data-scope="enemy">🎯 ENEMY</button></div>
       <div class="pwi-tabs">${[['profile','WAR PROFILE'],['team','WAR TEAM'],['members','MEMBERS'],['watch','PRE-WAR WATCH'],['help','HOW TO READ']].map(([v,l])=>`<button class="pwi-tab ${state.view===v?'active':''}" data-view="${v}">${l}</button>`).join('')}</div>
       ${state.view==='members'?`<div class="pwi-toolbar"><input id="pwi-search" value="${esc(state.filter)}" placeholder="Search member / ID / role…"><select id="pwi-sort"><option value="activityScore"${state.sort==='activityScore'?' selected':''}>War activity</option><option value="participation"${state.sort==='participation'?' selected':''}>Participation %</option><option value="avg"${state.sort==='avg'?' selected':''}>Avg hits</option><option value="totalHits"${state.sort==='totalHits'?' selected':''}>Total hits</option><option value="recent"${state.sort==='recent'?' selected':''}>Last war hits</option><option value="live"${state.sort==='live'?' selected':''}>Current activity</option><option value="level"${state.sort==='level'?' selected':''}>Level</option></select></div>`:''}
-      <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><button class="pwi-btn" data-act="wars" ${state.analyzing?'disabled':''}>SELECT WARS (${state.selectedWarIds.length})</button><button class="pwi-btn" data-act="fastscan" ${state.analyzing?'disabled':''}>FAST SCAN</button><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>FORCE RESCAN</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
+      <div class="pwi-toolbar2" style="padding:5px 7px;flex:0 0 auto;background:#111712"><button class="pwi-btn" data-act="wars" ${state.analyzing?'disabled':''}>SELECT WARS (${state.selectedWarIds.length})</button><button class="pwi-btn" data-act="history" ${state.analyzing?'disabled':''}>RESCAN SELECTED</button><button class="pwi-btn" data-act="deepterm" ${state.analyzing?'disabled':''}>DEEP TERM SCAN</button><button class="pwi-btn" data-act="export">EXPORT CSV</button><button class="pwi-btn" data-act="key">API KEY</button></div>
       <div class="pwi-warfilter"><span>WAR TYPE:</span><button class="pwi-btn ${state.warTypeFilter==='all'?'active':''}" data-warfilter="all">ALL</button><button class="pwi-btn ${state.warTypeFilter==='competitive'?'active':''}" data-warfilter="competitive">COMPETITIVE-LIKE</button><button class="pwi-btn ${state.warTypeFilter==='term'?'active':''}" data-warfilter="term">TERM-LIKE</button></div>
       <div class="pwi-body">${body}</div></div>`;
   }
 
   function render() {
-    // IMPORTANT: panel rendering is scanner/UI only.
-    // The header launcher is owned by startLauncherService() and is never touched here.
+    ensureUi();
     const old = document.getElementById(`${UI}-panel`);
     const oldBody = old?.querySelector('.pwi-body');
     const scroll = oldBody?.scrollTop || 0;
@@ -2879,7 +2207,7 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       buildAnalysisRows();
       const t = termSummary();
       if (next !== 'all' && !state.reports.length && state.loadedReports.length) {
-        state.warning = `None of the selected wars currently classify as ${next==='term'?'TERM-LIKE':'COMPETITIVE-LIKE'}. Switch to ALL to see each war’s percentage and source.`;
+        state.warning = `No selected wars currently match the ${next==='term'?'TERM-LIKE':'COMPETITIVE-LIKE'} graph filter.`;
       } else if (t.unknown && next !== 'all') {
         state.warning = `${t.unknown} selected war classification${t.unknown===1?' is':'s are'} unavailable and excluded from filtered views.`;
       } else {
@@ -2888,26 +2216,13 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
       state.progress = `${state.reports.length}/${state.loadedReports.length} wars • ${next==='term'?'TERM-LIKE':next==='competitive'?'COMPETITIVE-LIKE':'ALL'}`;
       render();
     }));
-    p.querySelector('[data-act="fastscan"]')?.addEventListener('click',()=>analyzeHistory(false));
     p.querySelector('[data-act="history"]')?.addEventListener('click',()=>analyzeHistory(true));
+    p.querySelector('[data-act="deepterm"]')?.addEventListener('click',()=>runManualDeepTermScan(true));
     p.querySelector('[data-act="export"]')?.addEventListener('click',exportCsv);
     p.querySelector('[data-act="key"]')?.addEventListener('click',()=>{state.apiKey='';storageSet('apiKey','');render();});
     p.querySelector('[data-act="savekey"]')?.addEventListener('click',()=>{const v=p.querySelector('#pwi-key')?.value?.trim();if(!v)return;state.apiKey=v;storageSet('apiKey',v);render();scanBase({analyze:true,forceHistory:true});});
     p.querySelector('#pwi-search')?.addEventListener('input',e=>{state.filter=e.target.value;render();const el=document.getElementById('pwi-search');if(el){el.focus();try{el.setSelectionRange(el.value.length,el.value.length)}catch(_){}}});
     p.querySelector('#pwi-sort')?.addEventListener('change',e=>{state.sort=e.target.value;render();});
-    p.querySelectorAll('[data-termoverride]').forEach(btn=>btn.addEventListener('click',()=>{
-      const warId=String(btn.dataset.war||''); if(!warId) return;
-      const value=saveTermOverride(warId, btn.dataset.termoverride||'auto');
-      const rep=(state.loadedReports||[]).find(r=>String(r.id)===warId);
-      if(rep){
-        let auto=loadTermGraph(warId);
-        if(!auto || auto.source==='manual') auto=classifyTermFromReport(rep);
-        rep.termGraph=applyTermOverride(rep, auto);
-      }
-      applyWarTypeFilter(); buildAnalysisRows();
-      state.warning = value==='auto' ? 'Automatic term detection restored for this war.' : `War #${warId} saved as ${value==='term'?'KNOWN TERMED':'KNOWN COMPETITIVE'}.`;
-      render();
-    }));
     p.querySelectorAll('[data-detail]').forEach(btn=>btn.addEventListener('click',()=>detailModal(btn.dataset.detail)));
   }
 
@@ -2928,82 +2243,32 @@ z-index:40!important;vertical-align:middle!important;flex:0 0 auto!important;
   }
 
   async function backgroundWatch() {
-    if (!state.open || !state.apiKey) return;
-    if (!state.targetId) {
-      await scanBase({analyze:false,forceHistory:false});
-      return;
-    }
+    if (!state.apiKey) return;
+    if (!state.targetId) { await scanBase({analyze:false,forceHistory:false}); return; }
     await liveRefresh();
   }
 
-  let launcherObserver = null;
-  let launcherRetryTimer = null;
-  let launcherHealthTimer = null;
+  function init() {
+    // Exact v3.6.1 launcher/core, but absolutely no scan runs at startup.
+    state.apiKey=storageGet('apiKey','');
+    ensureUi();
 
-  function launcherIsHealthy() {
-    const b = document.getElementById(`${UI}-btn`);
-    return !!(
-      b?.isConnected &&
-      !b.classList.contains('pwi-header-hidden') &&
-      lockedHeaderParent?.isConnected &&
-      b.parentElement === lockedHeaderParent
-    );
-  }
-
-  function startLauncherService() {
-    injectCss();
-
-    // Mount immediately. This service has no API dependency and never calls scanBase().
-    ensureLauncher();
-
-    if (launcherObserver) {
-      try { launcherObserver.disconnect(); } catch (_) {}
-    }
-
-    launcherObserver = new MutationObserver(() => {
-      if (launcherIsHealthy()) return;
-      clearTimeout(launcherRetryTimer);
-      launcherRetryTimer = setTimeout(() => {
-        if (!launcherIsHealthy()) ensureLauncher();
-      }, 140);
-    });
-    launcherObserver.observe(document.documentElement, { childList:true, subtree:true });
-
-    clearInterval(launcherHealthTimer);
-    launcherHealthTimer = setInterval(() => {
-      if (!launcherIsHealthy()) ensureLauncher();
-    }, 1800);
-  }
-
-  function startScannerService() {
-    // Scanner timers are allowed to run only while the board is open.
-    // This prevents startup/background API work from interfering with the launcher.
     clearInterval(state.timer);
     clearInterval(state.watchTimer);
     clearInterval(state.rediscoverTimer);
 
-    state.timer = setInterval(() => {
-      if (state.open && state.apiKey) liveRefresh();
-    }, LIVE_REFRESH_MS);
+    state.timer=setInterval(()=>{ if(state.open) liveRefresh(); },LIVE_REFRESH_MS);
+    state.watchTimer=setInterval(()=>{ if(state.open) backgroundWatch(); },WATCH_REFRESH_MS);
+    state.rediscoverTimer=setInterval(()=>{ if(state.open && state.apiKey) scanBase({analyze:false,forceHistory:false}); },REDISCOVER_MS);
 
-    state.watchTimer = setInterval(() => {
-      if (state.open && state.apiKey) backgroundWatch();
-    }, WATCH_REFRESH_MS);
-
-    state.rediscoverTimer = setInterval(() => {
-      if (state.open && state.apiKey) scanBase({ analyze:false, forceHistory:false }).catch(() => {});
-    }, REDISCOVER_MS);
-
-    // NO startup scan here.
-  }
-
-  function init() {
-    // 1) Launcher first. No API key needed.
-    state.apiKey = storageGet('apiKey','');
-    startLauncherService();
-
-    // 2) Scanner exists separately and remains idle until the panel is opened.
-    startScannerService();
+    let headerMountTimer=null;
+    const obs=new MutationObserver(()=>{
+      const b=document.getElementById(`${UI}-btn`);
+      if(b?.isConnected && lockedHeaderParent?.isConnected && b.parentElement===lockedHeaderParent) return;
+      clearTimeout(headerMountTimer);
+      headerMountTimer=setTimeout(ensureUi,180);
+    });
+    obs.observe(document.documentElement,{childList:true,subtree:true});
   }
 
   init();
